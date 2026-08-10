@@ -1,0 +1,37 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>true</IsPackable>
+    <PackageId>SqlCdc</PackageId>
+    <Title>SqlCdc</Title>
+    <Description>Real-time Change Data Capture (CDC) for SQL Server using native CDC. Polls the cdc capture instances and emits change events onto a System.Threading.Channels Channel&lt;T&gt;.</Description>
+    <Authors>s4ndr0ne</Authors>
+    <PackageTags>sql;sqlserver;cdc;change-data-capture;channel;streaming</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://example.com/SqlCdc</RepositoryUrl>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="SqlCdc.Tests" />
+  </ItemGroup>
+
+</Project>

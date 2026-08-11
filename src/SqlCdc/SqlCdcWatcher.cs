@@ -97,6 +97,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 _cts?.Dispose();
                 _cts = null;
                 _pollTask = null;
+                _channel = CreateChannel();
             }
 
             _tables.Clear();
@@ -112,7 +113,6 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 throw new InvalidOperationException("No CDC tables were resolved. Is CDC enabled for the configured tables?");
             }
 
-            _channel = CreateChannel();
             var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             var token = cts.Token;
             _cts = cts;
@@ -230,6 +230,13 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     await Task.Delay(_options.PollInterval, ct);
                 }
             }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogCritical(ex, "The CDC polling loop terminated unexpectedly.");
         }
         finally
         {

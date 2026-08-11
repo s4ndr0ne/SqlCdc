@@ -58,13 +58,14 @@ public sealed class SqlServerFixture : IAsyncLifetime
              );
              """);
 
-        await ExecuteAsync(
+        await ExecuteWithRetryAsync(
             $"""
              EXEC sys.sp_cdc_enable_table
                   @source_schema = N'dbo',
                   @source_name   = N'{tableName}',
                   @role_name     = NULL;
-             """);
+             """,
+            IsSqlServerAgentStartingError);
 
         await TuneCaptureJobAsync();
 
@@ -111,6 +112,37 @@ public sealed class SqlServerFixture : IAsyncLifetime
         await conn.OpenAsync();
         await using var cmd = new SqlCommand(sql, conn);
         await cmd.ExecuteNonQueryAsync();
+    }
+
+    private async Task ExecuteWithRetryAsync(
+        string sql,
+        Func<SqlException, bool> isTransient,
+        int maxAttempts = 30)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                await ExecuteAsync(sql);
+                return;
+            }
+            catch (SqlException ex) when (attempt < maxAttempts && isTransient(ex))
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1));
+            }
+        }
+    }
+
+    private static bool IsSqlServerAgentStartingError(SqlException exception)
+    {
+        if (exception.Errors.Cast<SqlError>().Any(error => error.Number is 14258 or 22836))
+        {
+            return true;
+        }
+
+        var message = exception.ToString();
+        return message.Contains("SQLServerAgent is starting", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("14258", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

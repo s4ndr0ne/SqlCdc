@@ -38,6 +38,15 @@ internal sealed class SqlCdcHostedService : BackgroundService
         if (!HasHandlers())
         {
             // No handlers registered: the application reads SqlCdcWatcher.Changes itself.
+            _logger.LogInformation("No CDC handlers are registered; leaving channel consumption to the application.");
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+            }
+
             return;
         }
 

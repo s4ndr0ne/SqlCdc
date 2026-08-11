@@ -361,10 +361,6 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     }
 
     /// <summary>
-    /// Determines the first LSN to read for a table that has no watermark yet, and
-    /// returns the cursor to start from (or <c>null</c> if the start point is not yet known).
-    /// </summary>
-    /// <summary>
     /// Picks the first LSN to read for a table that has no watermark yet. Returns the cursor to read
     /// from and, when the start point can be recorded without reading anything, the watermark to store.
     /// </summary>

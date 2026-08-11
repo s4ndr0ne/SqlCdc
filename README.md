@@ -1,23 +1,24 @@
 # SqlCdc
 
-Change Data Capture (CDC) in tempo reale per **SQL Server**, basato sul CDC nativo.
-Il package interroga le capture instance (`cdc.fn_cdc_get_all_changes_*`), ricostruisce gli eventi
-(insert/update/delete con immagini *before*/*after*) e li emette su un `System.Threading.Channels.Channel<CdcChange>`.
+Real-time Change Data Capture (CDC) for **SQL Server**, built on top of native CDC.
+The package polls capture instances (`cdc.fn_cdc_get_all_changes_*`), reconstructs
+events (insert/update/delete with *before*/*after* images) and delivers them over a
+`System.Threading.Channels.Channel<CdcChange>`.
 
-## Caratteristiche
+## Features
 
-- CDC nativo SQL Server: nessuna colonna aggiunta alle tabelle sorgente.
-- Eventi ricchi: immagine **before/after**, tipo operazione, LSN, commit time e **update mask**.
-- Watermark LSN persistito: il watcher riprende esattamente da dove si era fermato.
-- Channel bounded con backpressure: il consumer lento blocca il poller, niente perdita in memoria.
-- API fluente (`SqlCdcWatcherBuilder`).
+- Native SQL Server CDC: no extra columns added to source tables.
+- Rich events: **before/after** image, operation type, LSN, commit time, and **update mask**.
+- Persistent LSN watermark: the watcher resumes exactly where it left off.
+- Bounded channel with backpressure: a slow consumer stalls the poller instead of losing events.
+- Fluent API (`SqlCdcWatcherBuilder`).
 
-## Prerequisiti
+## Prerequisites
 
-- SQL Server (2016+) con CDC abilitato su database e tabelle:
+- SQL Server (2016+) with CDC enabled on the database and the target tables:
 
 ```sql
--- Richiede sysadmin o db_owner
+-- Requires sysadmin or db_owner
 EXEC sys.sp_cdc_enable_db;
 
 EXEC sys.sp_cdc_enable_table
@@ -26,7 +27,7 @@ EXEC sys.sp_cdc_enable_table
      @role_name     = NULL;
 ```
 
-## Utilizzo
+## Usage
 
 ```csharp
 using SqlCdc;
@@ -37,7 +38,7 @@ var watcher = SqlCdcWatcherBuilder
     .WatchTable("dbo", "Orders")
     .WatchTable("dbo", "Customers")
     .WithPollInterval(TimeSpan.FromMilliseconds(250))
-    .UseStateStore(new SqlCdcStateStore(connectionString))  // resume dopo riavvio
+    .UseStateStore(new SqlCdcStateStore(connectionString))  // resume after restart
     .Build();
 
 await watcher.StartAsync(cts.Token);
@@ -61,9 +62,9 @@ builder.Services.AddSqlCdc(cdc => cdc
 builder.Services.AddCdcChangeHandler<OrderChangedHandler>();
 ```
 
-`AddSqlCdc` registra il watcher come singleton e un `IHostedService` che lo avvia con l'host e lo
-ferma allo shutdown. Logger e `ICdcStateStore` vengono presi dal container se registrati; quello che
-imposti nel delegato ha la precedenza.
+`AddSqlCdc` registers the watcher as a singleton and an `IHostedService` that starts it
+with the host and stops it on shutdown. The logger and `ICdcStateStore` are resolved from
+the container when available; settings configured inside the delegate take precedence.
 
 ```csharp
 public sealed class OrderChangedHandler(AppDbContext db) : ICdcChangeHandler
@@ -75,16 +76,16 @@ public sealed class OrderChangedHandler(AppDbContext db) : ICdcChangeHandler
 }
 ```
 
-Ogni handler è **scoped** e viene risolto in uno scope dedicato per ciascun evento, quindi puoi
-iniettare un `DbContext` senza condividerlo tra eventi. Gli handler registrati ricevono tutti ogni
-evento, in ordine di registrazione. Se un handler solleva un'eccezione, l'errore viene loggato e
-l'evento **scartato**: il watermark avanza quando l'evento raggiunge il channel, non quando viene
-gestito, quindi il retry è responsabilità dell'handler.
+Each handler is **scoped** and resolved in a dedicated scope per event, so injecting a
+`DbContext` is safe. All registered handlers receive every event in registration order.
+If a handler throws, the error is logged and the event is **dropped**: the watermark
+advances when the event enters the channel, not when it is handled, so retry is the
+handler's responsibility.
 
-Senza handler registrati il watcher viene comunque avviato dall'host: inietta `SqlCdcWatcher` e
-consuma `Changes` direttamente.
+When no handlers are registered the watcher is still started by the host. Inject
+`SqlCdcWatcher` and consume `Changes` directly.
 
-### Modello evento
+### Event model
 
 ```csharp
 record CdcChange
@@ -96,66 +97,66 @@ record CdcChange
     DateTime CommitTime;
     IReadOnlyDictionary<string, object?> Before;
     IReadOnlyDictionary<string, object?> After;
-    IReadOnlyDictionary<string, bool> UpdateMask;  // colonne modificate (solo update)
-    string Key;                                     // id stabile per change
+    IReadOnlyDictionary<string, bool> UpdateMask;  // changed columns (update only)
+    string Key;                                     // stable per-change identifier
 }
 ```
 
-## Opzioni
+## Options
 
-| Metodo builder | Default | Descrizione |
+| Builder method | Default | Description |
 |---|---|---|
-| `WithPollInterval` | 500 ms | Frequenza di polling delle capture instance |
-| `WithBatchSize` | 1000 | Rows per ciclo per tabella (cap *soft*, vedi sotto) |
-| `WithChannelCapacity` | 100 000 | Capacità del channel (backpressure) |
-| `StartFrom` | `FromNow` | `FromNow` (dal max LSN corrente) o `FromBeginning` per lo storico |
-| `UseStateStore` | in-memory | `SqlCdcStateStore` per persistere il watermark LSN |
-| `WithRetryDelay` | 5 s | Attesa dopo un errore di polling |
+| `WithPollInterval` | 500 ms | Polling frequency per capture instance |
+| `WithBatchSize` | 1000 | Rows per cycle per table (soft cap, see below) |
+| `WithChannelCapacity` | 100 000 | Channel capacity (backpressure) |
+| `StartFrom` | `FromNow` | `FromNow` (skip history) or `FromBeginning` |
+| `UseStateStore` | in-memory | `SqlCdcStateStore` to persist the watermark LSN |
+| `WithRetryDelay` | 5 s | Delay after a polling error |
 
-## Semantica di consegna
+## Delivery semantics
 
-I batch vengono sempre tagliati su un confine di transazione (LSN), così le immagini *before* e
-*after* di un update restano insieme. Per questo `WithBatchSize` è un cap **soft**: una singola
-transazione più grande del batch viene letta comunque per intero (con un warning nei log).
+Batches are always cut on a transaction (LSN) boundary so the *before* and *after* images
+of an update stay together. For this reason `WithBatchSize` is a **soft** cap: a single
+transaction larger than the batch size is read in full (with a warning logged).
 
-Il channel è **bounded**: se il consumer non consuma, il poller si mette in attesa
-(`BoundedChannelFullMode.Wait`). Il watermark LSN viene salvato dopo ogni batch completato,
-per cui gli eventi sono consegnati **at-least-once**: in caso di crash un evento può essere riemesso
-alla ripresa. I consumer dovrebbero deduplicare usando `CdcChange.Key` se necessario.
+The channel is **bounded**: if the consumer falls behind, the poller blocks
+(`BoundedChannelFullMode.Wait`). The LSN watermark is saved after each completed batch,
+so events are delivered **at-least-once**: after a crash a batch may be re-emitted on
+restart. Consumers should deduplicate using `CdcChange.Key` if needed.
 
-### Retention CDC
+### CDC retention
 
-Il cleanup job di SQL Server elimina le change table oltre la retention configurata (3 giorni di
-default). Se il servizio resta fermo più a lungo, il watermark salvato punta a righe che non esistono
-più: il watcher **riparte dal più vecchio LSN ancora disponibile** ed emette un warning nei log.
-Le modifiche nel mezzo sono perse — è una perdita di dati inevitabile, ma esplicita e non un errore
-in loop. Per finestre di fermo più lunghe, alza la retention:
-`EXEC sys.sp_cdc_change_job @job_type='cleanup', @retention=<minuti>`.
+SQL Server's cleanup job trims change tables beyond the configured retention window
+(3 days by default). If the service is down longer than that, the saved watermark points
+to rows that no longer exist: the watcher **resumes from the oldest available LSN** and
+logs a warning. Changes in between are lost — a data loss that is explicit rather than
+a silent error loop. For longer outage windows, increase the retention:
+`EXEC sys.sp_cdc_change_job @job_type='cleanup', @retention=<minutes>`.
 
-### Isolamento degli errori
+### Error isolation
 
-Ogni tabella ha il proprio stato di errore: se una capture instance fallisce (permessi, CDC
-disabilitato, tabella rimossa), le altre continuano a essere pollate normalmente. La tabella in
-errore viene riprovata dopo `WithRetryDelay`, non ad ogni ciclo di polling.
+Each table has independent error state: if one capture instance fails (permissions, CDC
+disabled, table dropped), the others continue polling normally. The failing instance is
+retried after `WithRetryDelay`, not on every polling cycle.
 
-## Setup sviluppo
+## Development setup
 
 ```bash
 dotnet restore
 dotnet build SqlCdc.slnx
-dotnet test tests/SqlCdc.Tests                    # unit test, nessuna dipendenza esterna
-dotnet test tests/SqlCdc.IntegrationTests         # richiede Docker (vedi sotto)
-dotnet pack src/SqlCdc/SqlCdc.csproj -c Release   # genera il package NuGet
+dotnet test tests/SqlCdc.Tests                    # unit tests, no external dependencies
+dotnet test tests/SqlCdc.IntegrationTests         # requires Docker (see below)
+dotnet pack src/SqlCdc/SqlCdc.csproj -c Release   # build NuGet package
 ```
 
-### Test di integrazione
+### Integration tests
 
-Girano contro un SQL Server reale avviato con [Testcontainers](https://dotnet.testcontainers.org/):
-serve **Docker** in esecuzione. Il container parte con SQL Server Agent abilitato, perché senza Agent
-il capture job di CDC non gira e le change table restano vuote. Su Apple Silicon l'immagine è amd64 e
-viene eseguita in emulazione (serve Rosetta abilitata in Docker Desktop).
+Run against a real SQL Server instance started with [Testcontainers](https://dotnet.testcontainers.org/).
+**Docker** must be running. The container starts with SQL Server Agent enabled because without
+it the CDC capture job does not run and the change tables stay empty. On Apple Silicon the image
+is amd64 and runs under emulation (Rosetta must be enabled in Docker Desktop).
 
-Un run completo richiede circa 30 secondi più il primo avvio del container. Per escluderli:
+A full run takes roughly 30 seconds plus initial container startup. To skip them:
 
 ```bash
 dotnet test SqlCdc.slnx --filter "Category!=Integration"
@@ -168,4 +169,5 @@ SQLCDC_CONNECTION="Server=.;Database=MyDb;User Id=sa;Password=...;TrustServerCer
   dotnet run --project samples/SqlCdc.Sample
 ```
 
-Vedi `scripts/enable-cdc.sql` per abilitare CDC su una tabella di prova.
+See `scripts/enable-cdc.sql` to enable CDC on a sample table.
+

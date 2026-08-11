@@ -106,4 +106,19 @@ public class CdcChangePairerTests
 
         Assert.Equal(time, Assert.Single(changes).CommitTime);
     }
+
+    [Fact]
+    public void StartLsn_And_SeqVal_AreDefensiveCopies()
+    {
+        var row = Row(2, values: Values(("Id", 1)));
+        var change = Assert.Single(Pair(row));
+
+        Assert.NotSame(row.Lsn, change.StartLsn);
+        Assert.NotSame(row.SeqVal, change.SeqVal);
+
+        change.StartLsn[^1] = 0xFF;
+        change.SeqVal[^1] = 0xFF;
+        Assert.Equal(0x10, row.Lsn[^1]);
+        Assert.Equal(0x20, row.SeqVal[^1]);
+    }
 }

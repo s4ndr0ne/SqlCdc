@@ -112,6 +112,7 @@ record CdcChange
 | `StartFrom` | `FromNow` | `FromNow` (skip history) or `FromBeginning` |
 | `UseStateStore` | in-memory | `SqlCdcStateStore` to persist the watermark LSN |
 | `WithRetryDelay` | 5 s | Delay after a polling error |
+| `WithCommandTimeout` | 30 s | Timeout for each SQL round-trip against the CDC database |
 
 ## Delivery semantics
 

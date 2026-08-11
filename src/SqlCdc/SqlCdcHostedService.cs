@@ -30,17 +30,8 @@ internal sealed class SqlCdcHostedService : BackgroundService
         // path, so a database that is briefly unavailable delays CDC instead of failing the host.
         await Task.Yield();
 
-        try
+        if (!await StartWatcherAsync(stoppingToken))
         {
-            await _watcher.StartAsync(stoppingToken);
-        }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-        {
-            return;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogCritical(ex, "The CDC watcher failed to start. No change events will be delivered.");
             return;
         }
 
@@ -65,7 +56,44 @@ internal sealed class SqlCdcHostedService : BackgroundService
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         await base.StopAsync(cancellationToken);
-        await _watcher.StopAsync();
+        await _watcher.StopAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Starts the watcher, retrying with the configured <see cref="CdcWatcherOptions.RetryDelay"/>
+    /// until it succeeds or the host is stopped. Returns false when the host is shutting down.
+    /// </summary>
+    private async Task<bool> StartWatcherAsync(CancellationToken stoppingToken)
+    {
+        var retryDelay = _watcher.Options.RetryDelay;
+        while (true)
+        {
+            try
+            {
+                await _watcher.StartAsync(stoppingToken);
+                return true;
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "The CDC watcher failed to start; retrying in {RetryDelay}. No change events are being delivered yet.",
+                    retryDelay);
+
+                try
+                {
+                    await Task.Delay(retryDelay, stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    return false;
+                }
+            }
+        }
     }
 
     private bool HasHandlers()

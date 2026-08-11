@@ -70,8 +70,11 @@ internal static class CdcChangePairer
             SourceSchema = schema,
             SourceTable = table,
             Operation = operation,
-            StartLsn = row.Lsn,
-            SeqVal = row.SeqVal,
+            // Copy the arrays: the row's LSN is also the batch's watermark reference, and the
+            // change is handed to consumers as soon as it is written to the channel. Aliasing
+            // would let a consumer mutate the persisted watermark through CdcChange.StartLsn.
+            StartLsn = (byte[])row.Lsn.Clone(),
+            SeqVal = (byte[])row.SeqVal.Clone(),
             CommitTime = commitTime,
             Before = before,
             After = after,

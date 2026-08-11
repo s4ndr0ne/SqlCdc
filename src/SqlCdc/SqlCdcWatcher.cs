@@ -19,24 +19,54 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     private readonly CdcWatcherOptions _options;
     private readonly ICdcStateStore _stateStore;
     private readonly ILogger _logger;
-    private readonly Channel<CdcChange> _channel;
+    private Channel<CdcChange> _channel;
     private readonly ConcurrentDictionary<string, TableRuntime> _tables = new();
+    private readonly SemaphoreSlim _stateLock = new(1, 1);
     private CancellationTokenSource? _cts;
     private Task? _pollTask;
 
     internal SqlCdcWatcher(CdcWatcherOptions options, ICdcStateStore stateStore, ILogger? logger = null)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(stateStore);
+
+        if (options.PollInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "PollInterval must be positive.");
+        }
+
+        if (options.BatchSize <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "BatchSize must be positive.");
+        }
+
+        if (options.ChannelCapacity <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "ChannelCapacity must be positive.");
+        }
+
+        if (options.RetryDelay <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "RetryDelay must be positive.");
+        }
+
+        if (options.CommandTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "CommandTimeout must be positive.");
+        }
+
         _options = options;
         _stateStore = stateStore;
         _logger = logger ?? NullLogger<SqlCdcWatcher>.Instance;
 
-        _channel = System.Threading.Channels.Channel.CreateBounded<CdcChange>(new BoundedChannelOptions(options.ChannelCapacity)
-        {
-            FullMode = BoundedChannelFullMode.Wait,
-            SingleReader = false,
-            SingleWriter = true,
-        });
+        _channel = CreateChannel();
     }
+
+    /// <summary>The effective options for this watcher.</summary>
+    internal CdcWatcherOptions Options => _options;
+
+    private int CommandTimeoutSeconds =>
+        (int)Math.Clamp(Math.Ceiling(_options.CommandTimeout.TotalSeconds), 1, int.MaxValue);
 
     /// <summary>The bounded channel events are delivered onto.</summary>
     public Channel<CdcChange> Channel => _channel;
@@ -49,49 +79,91 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
     /// <summary>
     /// Resolves the capture instances for the configured tables and starts the polling loop.
+    /// Safe to call repeatedly and concurrently with <see cref="StopAsync"/>.
     /// </summary>
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        foreach (var subscription in _options.Tables)
-        {
-            var runtime = await ResolveTableAsync(subscription, cancellationToken);
-            runtime.Watermark = await _stateStore.GetLastLsnAsync(runtime.CaptureInstance, cancellationToken);
-            _tables[runtime.CaptureInstance] = runtime;
-        }
-
-        if (_tables.Count == 0)
-        {
-            throw new InvalidOperationException("No CDC tables were resolved. Is CDC enabled for the configured tables?");
-        }
-
-        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        _pollTask = Task.Run(() => RunLoopAsync(_cts.Token));
-    }
-
-    /// <summary>Stops the polling loop and completes the channel.</summary>
-    public async Task StopAsync()
-    {
-        if (_cts is null)
-        {
-            return;
-        }
-
-        _cts.Cancel();
+        await _stateLock.WaitAsync(cancellationToken);
         try
         {
+            if (_pollTask is { IsCompleted: false })
+            {
+                return;
+            }
+
             if (_pollTask is not null)
             {
-                await _pollTask;
+                _channel.Writer.TryComplete();
+                _cts?.Dispose();
+                _cts = null;
+                _pollTask = null;
             }
-        }
-        catch (OperationCanceledException)
-        {
+
+            _tables.Clear();
+            foreach (var subscription in _options.Tables)
+            {
+                var runtime = await ResolveTableAsync(subscription, cancellationToken);
+                runtime.Watermark = await _stateStore.GetLastLsnAsync(runtime.CaptureInstance, cancellationToken);
+                _tables[runtime.CaptureInstance] = runtime;
+            }
+
+            if (_tables.Count == 0)
+            {
+                throw new InvalidOperationException("No CDC tables were resolved. Is CDC enabled for the configured tables?");
+            }
+
+            _channel = CreateChannel();
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var token = cts.Token;
+            _cts = cts;
+            _pollTask = Task.Run(() => RunLoopAsync(token));
         }
         finally
         {
-            _channel.Writer.TryComplete();
-            _cts.Dispose();
-            _cts = null;
+            _stateLock.Release();
+        }
+    }
+
+    /// <summary>Stops the polling loop and completes the channel.</summary>
+    public async Task StopAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await _stateLock.WaitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        try
+        {
+            if (_cts is null)
+            {
+                return;
+            }
+
+            _cts.Cancel();
+            try
+            {
+                if (_pollTask is not null)
+                {
+                    await _pollTask;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                _channel.Writer.TryComplete();
+                _cts.Dispose();
+                _cts = null;
+                _pollTask = null;
+            }
+        }
+        finally
+        {
+            _stateLock.Release();
         }
     }
 
@@ -100,50 +172,70 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         await StopAsync();
     }
 
+    private Channel<CdcChange> CreateChannel() =>
+        System.Threading.Channels.Channel.CreateBounded<CdcChange>(new BoundedChannelOptions(_options.ChannelCapacity)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = false,
+            SingleWriter = true,
+        });
+
     private async Task RunLoopAsync(CancellationToken ct)
     {
-        while (!ct.IsCancellationRequested)
+        try
         {
-            foreach (var table in _tables.Values)
+            while (!ct.IsCancellationRequested)
             {
-                if (ct.IsCancellationRequested)
+                foreach (var table in _tables.Values)
                 {
-                    return;
+                    if (ct.IsCancellationRequested)
+                    {
+                        return;
+                    }
+
+                    // A table that just failed backs off on its own, so a single broken capture
+                    // instance neither blocks the healthy ones nor is retried every poll interval.
+                    if (Environment.TickCount64 < table.NextAttemptTick)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        await PollTableAsync(table, ct);
+                        table.ConsecutiveFailures = 0;
+                        table.NextAttemptTick = 0;
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        table.ConsecutiveFailures++;
+                        var retryMs = _options.RetryDelay.TotalMilliseconds;
+                        table.NextAttemptTick = retryMs > long.MaxValue - Environment.TickCount64
+                            ? long.MaxValue
+                            : Environment.TickCount64 + (long)retryMs;
+                        _logger.LogError(
+                            ex,
+                            "CDC polling failed for capture instance {CaptureInstance} " +
+                            "({ConsecutiveFailures} consecutive failures), retrying in {RetryDelay}",
+                            table.CaptureInstance, table.ConsecutiveFailures, _options.RetryDelay);
+                    }
                 }
 
-                // A table that just failed backs off on its own, so a single broken capture
-                // instance neither blocks the healthy ones nor is retried every poll interval.
-                if (Environment.TickCount64 < table.NextAttemptTick)
+                if (!ct.IsCancellationRequested)
                 {
-                    continue;
-                }
-
-                try
-                {
-                    await PollTableAsync(table, ct);
-                    table.ConsecutiveFailures = 0;
-                    table.NextAttemptTick = 0;
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    table.ConsecutiveFailures++;
-                    table.NextAttemptTick = Environment.TickCount64 + (long)_options.RetryDelay.TotalMilliseconds;
-                    _logger.LogError(
-                        ex,
-                        "CDC polling failed for capture instance {CaptureInstance} " +
-                        "({ConsecutiveFailures} consecutive failures), retrying in {RetryDelay}",
-                        table.CaptureInstance, table.ConsecutiveFailures, _options.RetryDelay);
+                    await Task.Delay(_options.PollInterval, ct);
                 }
             }
-
-            if (!ct.IsCancellationRequested)
-            {
-                await Task.Delay(_options.PollInterval, ct);
-            }
+        }
+        finally
+        {
+            // External cancellation must complete readers too; StopAsync remains responsible for
+            // disposing the CTS and allowing a later StartAsync to create a fresh channel.
+            _channel.Writer.TryComplete();
         }
     }
 
@@ -182,13 +274,19 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         // fn_cdc_get_all_changes fail on every poll. Clamp forward and report the gap instead.
         if (minLsn is not null && LsnHelpers.Compare(cursor, minLsn) < 0)
         {
-            _logger.LogWarning(
-                "Capture instance {CaptureInstance}: next LSN to read {Cursor} is older than the earliest " +
-                "retained LSN {MinLsn}. The changes in between were removed by the CDC cleanup job and " +
-                "are lost; resuming from the earliest retained LSN.",
-                table.CaptureInstance,
-                Convert.ToHexString(cursor),
-                Convert.ToHexString(minLsn));
+            // Report the loss once per min LSN: while the watermark stays stale and no new data
+            // arrives the clamp fires on every poll, which would otherwise spam the warning.
+            if (table.LastClampedMinLsn is null || !table.LastClampedMinLsn.AsSpan().SequenceEqual(minLsn))
+            {
+                _logger.LogWarning(
+                    "Capture instance {CaptureInstance}: next LSN to read {Cursor} is older than the earliest " +
+                    "retained LSN {MinLsn}. The changes in between were removed by the CDC cleanup job and " +
+                    "are lost; resuming from the earliest retained LSN.",
+                    table.CaptureInstance,
+                    Convert.ToHexString(cursor),
+                    Convert.ToHexString(minLsn));
+                table.LastClampedMinLsn = (byte[])minLsn.Clone();
+            }
 
             cursor = minLsn;
         }
@@ -219,12 +317,13 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
     private async Task<ChangeBatch> ReadChangesAsync(TableRuntime table, byte[] fromLsn, byte[] toLsn, CancellationToken ct)
     {
-        var functionName = $"cdc.fn_cdc_get_all_changes_{table.CaptureInstance}";
+        var functionName = $"cdc.{SqlIdentifier.Quote($"fn_cdc_get_all_changes_{table.CaptureInstance}", nameof(table.CaptureInstance))}";
         var builder = new ChangeBatchBuilder(_options.BatchSize);
 
         await using var conn = new SqlConnection(_options.ConnectionString);
         await conn.OpenAsync(ct);
         await using var cmd = new SqlCommand($"SELECT * FROM {functionName}(@from, @to, N'all update old')", conn);
+        cmd.CommandTimeout = CommandTimeoutSeconds;
         cmd.Parameters.Add("@from", SqlDbType.Binary, 10).Value = fromLsn;
         cmd.Parameters.Add("@to", SqlDbType.Binary, 10).Value = toLsn;
 
@@ -293,6 +392,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             """;
 
         await using var cmd = new SqlCommand(sql, conn);
+        cmd.CommandTimeout = CommandTimeoutSeconds;
         cmd.Parameters.AddWithValue("@schema", subscription.Schema);
         cmd.Parameters.AddWithValue("@table", subscription.Table);
         var captureInstance = subscription.CaptureInstance ?? (string?)await cmd.ExecuteScalarAsync(ct);
@@ -314,7 +414,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         return new TableRuntime(subscription.Schema, subscription.Table, captureInstance, columns);
     }
 
-    private static async Task<List<string>> GetCapturedColumnsAsync(SqlConnection conn, string captureInstance, CancellationToken ct)
+    private async Task<List<string>> GetCapturedColumnsAsync(SqlConnection conn, string captureInstance, CancellationToken ct)
     {
         const string sql =
             """
@@ -327,6 +427,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
         var result = new List<string>();
         await using var cmd = new SqlCommand(sql, conn);
+        cmd.CommandTimeout = CommandTimeoutSeconds;
         cmd.Parameters.AddWithValue("@ci", captureInstance);
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
@@ -347,6 +448,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         await conn.OpenAsync(ct);
         await using var cmd = new SqlCommand(
             "SELECT sys.fn_cdc_get_max_lsn(), sys.fn_cdc_get_min_lsn(@ci);", conn);
+        cmd.CommandTimeout = CommandTimeoutSeconds;
         cmd.Parameters.AddWithValue("@ci", captureInstance);
 
         await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -415,6 +517,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             var tuples = string.Join(",", Enumerable.Range(0, chunk.Length).Select(i => $"(@l{i})"));
             await using var cmd = new SqlCommand(
                 $"SELECT v.lsn, sys.fn_cdc_map_lsn_to_time(v.lsn) FROM (VALUES {tuples}) AS v(lsn);", conn);
+            cmd.CommandTimeout = CommandTimeoutSeconds;
             for (var i = 0; i < chunk.Length; i++)
             {
                 cmd.Parameters.Add($"@l{i}", SqlDbType.Binary, 10).Value = chunk[i];
@@ -456,5 +559,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
         /// <summary><see cref="Environment.TickCount64"/> before which this table is not polled again.</summary>
         public long NextAttemptTick { get; set; }
+
+        /// <summary>The min LSN for which the retention-gap warning was last reported, so it is not repeated.</summary>
+        public byte[]? LastClampedMinLsn { get; set; }
     }
 }

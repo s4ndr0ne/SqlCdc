@@ -45,4 +45,7 @@ public sealed class CdcWatcherOptions
 
     /// <summary>Delay before retrying after an error. Defaults to 5 seconds.</summary>
     public TimeSpan RetryDelay { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>Timeout for each SQL round-trip against the CDC database. Defaults to 30 seconds.</summary>
+    public TimeSpan CommandTimeout { get; set; } = TimeSpan.FromSeconds(30);
 }

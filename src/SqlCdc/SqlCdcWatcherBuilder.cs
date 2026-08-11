@@ -16,6 +16,7 @@ public sealed class SqlCdcWatcherBuilder
     private int _channelCapacity = 100_000;
     private CdcStartMode _startMode = CdcStartMode.FromNow;
     private TimeSpan _retryDelay = TimeSpan.FromSeconds(5);
+    private TimeSpan _commandTimeout = TimeSpan.FromSeconds(30);
 
     private SqlCdcWatcherBuilder()
     {
@@ -107,6 +108,17 @@ public sealed class SqlCdcWatcherBuilder
         return this;
     }
 
+    public SqlCdcWatcherBuilder WithCommandTimeout(TimeSpan commandTimeout)
+    {
+        if (commandTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(commandTimeout), "Command timeout must be positive.");
+        }
+
+        _commandTimeout = commandTimeout;
+        return this;
+    }
+
     public SqlCdcWatcher Build()
     {
         if (string.IsNullOrWhiteSpace(_connectionString))
@@ -128,6 +140,7 @@ public sealed class SqlCdcWatcherBuilder
             ChannelCapacity = _channelCapacity,
             StartMode = _startMode,
             RetryDelay = _retryDelay,
+            CommandTimeout = _commandTimeout,
         };
 
         return new SqlCdcWatcher(options, _stateStore ?? new InMemoryCdcStateStore(), _logger);

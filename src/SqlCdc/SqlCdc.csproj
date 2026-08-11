@@ -8,12 +8,14 @@
     <IsPackable>true</IsPackable>
     <PackageId>SqlCdc</PackageId>
     <Title>SqlCdc</Title>
-    <Description>Real-time Change Data Capture (CDC) for SQL Server using native CDC. Polls the cdc capture instances and emits change events onto a System.Threading.Channels Channel&lt;T&gt;.</Description>
+    <Version>1.0.0</Version>
     <Authors>s4ndr0ne</Authors>
+    <Description>Real-time Change Data Capture (CDC) for SQL Server using native CDC. Polls the cdc capture instances and emits change events onto a System.Threading.Channels Channel&lt;T&gt;.</Description>
     <PackageTags>sql;sqlserver;cdc;change-data-capture;channel;streaming</PackageTags>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <RepositoryUrl>https://example.com/SqlCdc</RepositoryUrl>
+    <RepositoryUrl>https://github.com/s4ndr0ne/SqlCdc</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
     <IncludeSymbols>true</IncludeSymbols>
@@ -28,6 +30,7 @@
 
   <ItemGroup>
     <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <None Include="../../LICENSE" Pack="true" PackagePath="/" />
   </ItemGroup>
 
   <ItemGroup>

@@ -121,4 +121,120 @@ public class CdcChangePairerTests
         Assert.Equal(0x10, row.Lsn[^1]);
         Assert.Equal(0x20, row.SeqVal[^1]);
     }
+
+    // --- __$update_mask su più di un byte -------------------------------------------------
+    //
+    // La maschera è indicizzata DALLA FINE: l'ordinale 1 è il bit meno significativo
+    // dell'ULTIMO byte dell'array. Lo dice l'implementazione di sys.fn_cdc_is_bit_set:
+    //
+    //     SUBSTRING(@update_mask, DATALENGTH(@update_mask) - ((@position - 1) / 8), 1)
+    //         & POWER(2, (@position - 1) % 8)
+    //
+    // Con al più 8 colonne catturate la maschera occupa un solo byte e indicizzare
+    // dall'inizio o dalla fine è equivalente: è la ragione per cui gli altri test
+    // (tabelle da 3 colonne) non intercettano l'inversione. Da 9 colonne in su i byte
+    // sono due e l'ordine conta.
+
+    private static readonly string[] NineColumns =
+        { "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9" };
+
+    /// <summary>Costruisce una maschera a 2 byte per 9 colonne, con il layout usato da SQL Server.</summary>
+    private static byte[] NineColumnMask(params int[] changedOrdinals)
+    {
+        var mask = new byte[2];
+        foreach (var ordinal in changedOrdinals)
+        {
+            var byteIndex = mask.Length - 1 - ((ordinal - 1) / 8);
+            mask[byteIndex] |= (byte)(1 << ((ordinal - 1) % 8));
+        }
+
+        return mask;
+    }
+
+    private static CdcChange PairWideUpdate(byte[] mask)
+    {
+        var values = Values(NineColumns.Select(c => (c, (object?)c)).ToArray());
+        var before = Row(3, values: values);
+        var after = Row(4, seqVal: before.SeqVal, values: values, mask: mask);
+
+        return Assert.Single(
+            CdcChangePairer.Pair("dbo", "Wide", "dbo_Wide", NineColumns, new[] { before, after },
+                    new Dictionary<string, DateTime>())
+                .ToList());
+    }
+
+    [Fact]
+    public void UpdateMask_NineColumns_ReadsFirstColumnFromTheLastByte()
+    {
+        // Modificata solo C1 (ordinale 1) => 0x00 0x01.
+        var mask = NineColumnMask(1);
+        Assert.Equal(new byte[] { 0x00, 0x01 }, mask);
+
+        var change = PairWideUpdate(mask);
+
+        Assert.True(change.UpdateMask["C1"]);
+        foreach (var column in NineColumns.Skip(1))
+        {
+            Assert.False(change.UpdateMask[column]);
+        }
+    }
+
+    [Fact]
+    public void UpdateMask_NineColumns_ReadsNinthColumnFromTheFirstByte()
+    {
+        // Modificata solo C9 (ordinale 9) => 0x01 0x00.
+        var mask = NineColumnMask(9);
+        Assert.Equal(new byte[] { 0x01, 0x00 }, mask);
+
+        var change = PairWideUpdate(mask);
+
+        Assert.True(change.UpdateMask["C9"]);
+        foreach (var column in NineColumns.Take(8))
+        {
+            Assert.False(change.UpdateMask[column]);
+        }
+    }
+
+    [Fact]
+    public void UpdateMask_NineColumns_HandlesBitsInBothBytes()
+    {
+        // Modificate C2, C8 e C9 => 0x01 0x82.
+        var mask = NineColumnMask(2, 8, 9);
+        Assert.Equal(new byte[] { 0x01, 0b1000_0010 }, mask);
+
+        var change = PairWideUpdate(mask);
+
+        var expected = new Dictionary<string, bool>
+        {
+            ["C1"] = false,
+            ["C2"] = true,
+            ["C3"] = false,
+            ["C4"] = false,
+            ["C5"] = false,
+            ["C6"] = false,
+            ["C7"] = false,
+            ["C8"] = true,
+            ["C9"] = true,
+        };
+
+        foreach (var (column, wasUpdated) in expected)
+        {
+            Assert.Equal(wasUpdated, change.UpdateMask[column]);
+        }
+    }
+
+    [Fact]
+    public void UpdateMask_SingleByteMask_StaysCorrect()
+    {
+        // Guardia di regressione: con maschera a un byte solo il comportamento non cambia.
+        var before = Row(3, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 9.99m)));
+        var after = Row(4, seqVal: before.SeqVal, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 12.50m)),
+            mask: new byte[] { 0b0000_0100 });
+
+        var change = Assert.Single(Pair(before, after));
+
+        Assert.False(change.UpdateMask["Id"]);
+        Assert.False(change.UpdateMask["Name"]);
+        Assert.True(change.UpdateMask["Price"]);
+    }
 }

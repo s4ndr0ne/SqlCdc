@@ -86,9 +86,10 @@ internal static class CdcChangePairer
         var result = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         for (var i = 0; i < columns.Count; i++)
         {
-            var bitIndex = i % 8;
-            var byteIndex = i / 8;
-            var updated = byteIndex < mask.Length && ((mask[byteIndex] >> bitIndex) & 1) == 1;
+            // __$update_mask è indicizzata dalla fine: l'ordinale 1 è il bit meno
+            // significativo dell'ultimo byte dell'array (cfr. sys.fn_cdc_is_bit_set).
+            var byteIndex = mask.Length - 1 - (i / 8);
+            var updated = byteIndex >= 0 && ((mask[byteIndex] >> (i % 8)) & 1) == 1;
             result[columns[i]] = updated;
         }
 

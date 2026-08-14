@@ -1,3 +1,4 @@
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
 
 namespace SqlCdc;
@@ -21,6 +22,8 @@ public sealed class SqlCdcWatcherBuilder
     private TimeSpan _leaseRetryDelay = TimeSpan.FromSeconds(10);
     private ICdcLeaseProvider? _leaseProvider;
     private string? _singleActiveInstanceLeaseName;
+    private ICdcConnectionFactory? _connectionFactory;
+    private Func<SqlAuthenticationParameters, CancellationToken, Task<SqlAuthenticationToken>>? _accessTokenCallback;
     private string _name = "default";
     private int _maxHandlerAttempts = 1;
     private TimeSpan _handlerRetryDelay = TimeSpan.FromSeconds(1);
@@ -216,11 +219,62 @@ public sealed class SqlCdcWatcherBuilder
         return this;
     }
 
+    /// <summary>
+    /// Opens every connection — CDC reads, watermarks and the lease — through the given factory
+    /// instead of a plain connection string. This is the hook for a configured
+    /// <c>TokenCredential</c>, a <c>SqlRetryLogicBaseProvider</c>, or any other per-connection
+    /// setup; a connection string is then no longer required.
+    /// </summary>
+    public SqlCdcWatcherBuilder UseConnectionFactory(ICdcConnectionFactory connectionFactory)
+    {
+        ArgumentNullException.ThrowIfNull(connectionFactory);
+
+        _connectionFactory = connectionFactory;
+        return this;
+    }
+
+    /// <inheritdoc cref="UseConnectionFactory(ICdcConnectionFactory)"/>
+    /// <param name="openConnection">
+    /// Returns a connection to the CDC database, ideally already open. Called once per operation,
+    /// so it must hand out a new connection each time rather than share one.
+    /// </param>
+    public SqlCdcWatcherBuilder UseConnectionFactory(Func<CancellationToken, Task<SqlConnection>> openConnection)
+    {
+        ArgumentNullException.ThrowIfNull(openConnection);
+
+        _connectionFactory = new DelegateCdcConnectionFactory(openConnection);
+        return this;
+    }
+
+    /// <summary>
+    /// Acquires an access token per connection, for Entra ID authentication driven by the
+    /// application — a configured <c>TokenCredential</c>, for instance. Not needed when the
+    /// connection string already says <c>Authentication=Active Directory ...</c>, which
+    /// Microsoft.Data.SqlClient handles on its own.
+    /// </summary>
+    public SqlCdcWatcherBuilder UseAccessTokenCallback(
+        Func<SqlAuthenticationParameters, CancellationToken, Task<SqlAuthenticationToken>> accessTokenCallback)
+    {
+        ArgumentNullException.ThrowIfNull(accessTokenCallback);
+
+        _accessTokenCallback = accessTokenCallback;
+        return this;
+    }
+
     public SqlCdcWatcher Build()
     {
-        if (string.IsNullOrWhiteSpace(_connectionString))
+        if (string.IsNullOrWhiteSpace(_connectionString) && _connectionFactory is null)
         {
-            throw new InvalidOperationException("A connection string is required. Call UseConnectionString(...).");
+            throw new InvalidOperationException(
+                "A connection string is required. Call UseConnectionString(...), or supply a connection " +
+                "factory with UseConnectionFactory(...).");
+        }
+
+        if (_accessTokenCallback is not null && _connectionFactory is not null)
+        {
+            throw new InvalidOperationException(
+                "UseAccessTokenCallback(...) configures the built-in connection factory and cannot be combined " +
+                "with UseConnectionFactory(...). Set the callback on the connections your factory returns.");
         }
 
         if (_tables.Count == 0)
@@ -245,12 +299,15 @@ public sealed class SqlCdcWatcherBuilder
             HandlerRetryDelay = _handlerRetryDelay,
         };
 
+        var connections = _connectionFactory
+            ?? new SqlCdcConnectionFactory(_connectionString!, _accessTokenCallback);
+
         var leaseProvider = _leaseProvider;
         var ownsLeaseProvider = false;
         if (_singleActiveInstanceLeaseName is not null)
         {
             leaseProvider = new SqlApplicationLockLeaseProvider(
-                _connectionString, _singleActiveInstanceLeaseName, _logger);
+                connections, _singleActiveInstanceLeaseName, _logger);
             ownsLeaseProvider = true;
         }
 
@@ -259,6 +316,7 @@ public sealed class SqlCdcWatcherBuilder
             _stateStore ?? new InMemoryCdcStateStore(),
             _logger,
             leaseProvider,
-            ownsLeaseProvider);
+            ownsLeaseProvider,
+            connections);
     }
 }

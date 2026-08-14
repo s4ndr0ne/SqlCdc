@@ -22,6 +22,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
     private readonly CdcWatcherOptions _options;
     private readonly ICdcStateStore _stateStore;
+    private readonly ICdcConnectionFactory _connections;
     private readonly ICdcLeaseProvider _leaseProvider;
     private readonly bool _ownsLeaseProvider;
     private readonly ILogger _logger;
@@ -38,7 +39,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         ICdcStateStore stateStore,
         ILogger? logger = null,
         ICdcLeaseProvider? leaseProvider = null,
-        bool ownsLeaseProvider = false)
+        bool ownsLeaseProvider = false,
+        ICdcConnectionFactory? connections = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(stateStore);
@@ -90,6 +92,10 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
         _options = options;
         _stateStore = stateStore;
+        _connections = connections ?? (string.IsNullOrWhiteSpace(options.ConnectionString)
+            ? throw new ArgumentException(
+                "Either a connection string or a connection factory is required.", nameof(options))
+            : new SqlCdcConnectionFactory(options.ConnectionString));
         _leaseProvider = leaseProvider ?? NullCdcLeaseProvider.Instance;
         _ownsLeaseProvider = ownsLeaseProvider && leaseProvider is not null;
         _logger = logger ?? NullLogger<SqlCdcWatcher>.Instance;
@@ -606,8 +612,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         var functionName = $"cdc.{SqlIdentifier.Quote($"fn_cdc_get_all_changes_{table.CaptureInstance}", nameof(table.CaptureInstance))}";
         var builder = new ChangeBatchBuilder(_options.BatchSize);
 
-        await using var conn = new SqlConnection(_options.ConnectionString);
-        await conn.OpenAsync(ct);
+        await using var conn = await _connections.OpenConnectionAsync(ct);
         await using var cmd = new SqlCommand($"SELECT * FROM {functionName}(@from, @to, N'all update old')", conn);
         cmd.CommandTimeout = CommandTimeoutSeconds;
         cmd.Parameters.Add("@from", SqlDbType.Binary, 10).Value = fromLsn;
@@ -665,8 +670,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
     private async Task<TableRuntime> ResolveTableAsync(CdcTableSubscription subscription, CancellationToken ct)
     {
-        await using var conn = new SqlConnection(_options.ConnectionString);
-        await conn.OpenAsync(ct);
+        await using var conn = await _connections.OpenConnectionAsync(ct);
 
         const string sql =
             """
@@ -730,8 +734,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// </summary>
     private async Task<(byte[]? MaxLsn, byte[]? MinLsn)> GetLogBoundsAsync(string captureInstance, CancellationToken ct)
     {
-        await using var conn = new SqlConnection(_options.ConnectionString);
-        await conn.OpenAsync(ct);
+        await using var conn = await _connections.OpenConnectionAsync(ct);
         await using var cmd = new SqlCommand(
             "SELECT sys.fn_cdc_get_max_lsn(), sys.fn_cdc_get_min_lsn(@ci);", conn);
         cmd.CommandTimeout = CommandTimeoutSeconds;
@@ -800,8 +803,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             return (result, serverTime);
         }
 
-        await using var conn = new SqlConnection(_options.ConnectionString);
-        await conn.OpenAsync(ct);
+        await using var conn = await _connections.OpenConnectionAsync(ct);
 
         // One round-trip per chunk rather than per LSN. The chunk size stays well under the
         // 1000-row limit of a table value constructor and the 2100-parameter limit.

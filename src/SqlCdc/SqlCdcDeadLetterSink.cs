@@ -15,17 +15,29 @@ public sealed class SqlCdcDeadLetterSink : ICdcDeadLetterSink
         WriteIndented = false,
     };
 
-    private readonly string _connectionString;
+    private readonly ICdcConnectionFactory _connections;
     private readonly string _schema;
     private readonly string _table;
     private readonly SemaphoreSlim _ensureLock = new(1, 1);
     private bool _tableEnsured;
 
     public SqlCdcDeadLetterSink(string connectionString, string schema = "dbo", string table = "cdc_dead_letter")
+        : this(new SqlCdcConnectionFactory(connectionString), schema, table)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+    }
 
-        _connectionString = connectionString;
+    /// <summary>
+    /// Uses the given factory to open its connections, so dead letters are written with the same
+    /// credentials and connection configuration as everything else.
+    /// </summary>
+    public SqlCdcDeadLetterSink(
+        ICdcConnectionFactory connections,
+        string schema = "dbo",
+        string table = "cdc_dead_letter")
+    {
+        ArgumentNullException.ThrowIfNull(connections);
+
+        _connections = connections;
         _schema = schema;
         _table = table;
     }
@@ -42,8 +54,7 @@ public sealed class SqlCdcDeadLetterSink : ICdcDeadLetterSink
             await EnsureTableAsync(cancellationToken);
             try
             {
-                await using var conn = new SqlConnection(_connectionString);
-                await conn.OpenAsync(cancellationToken);
+                await using var conn = await _connections.OpenConnectionAsync(cancellationToken);
 
                 var sql =
                     $"""
@@ -130,8 +141,7 @@ public sealed class SqlCdcDeadLetterSink : ICdcDeadLetterSink
                 return;
             }
 
-            await using var conn = new SqlConnection(_connectionString);
-            await conn.OpenAsync(cancellationToken);
+            await using var conn = await _connections.OpenConnectionAsync(cancellationToken);
             var sql =
                 $"""
                  IF OBJECT_ID(@tableName, N'U') IS NULL

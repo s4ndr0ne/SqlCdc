@@ -19,6 +19,8 @@ events (insert/update/delete with *before*/*after* images) and delivers them ove
   the difference between "idle" and "stuck".
 - **Handler retry and dead-letter queue**: a failing change is retried and then parked for
   inspection instead of vanishing into a log line.
+- **Configurable from `IConfiguration`**, with Entra ID / Managed Identity and a connection
+  factory for anything the connection string cannot express.
 - Fluent API (`SqlCdcWatcherBuilder`).
 
 ## Prerequisites
@@ -92,6 +94,99 @@ dropped — see [Handler failures](#handler-failures-retry-and-dead-letter-queue
 When no handlers are registered the watcher is still started by the host. Inject
 `SqlCdcWatcher` and consume `Changes` directly.
 
+### Configuration
+
+Everything can come from a configuration section instead of code:
+
+```csharp
+builder.Services.AddSqlCdc(builder.Configuration.GetSection("SqlCdc"));
+```
+
+```jsonc
+{
+  "SqlCdc": {
+    "ConnectionString": "Server=.;Database=Sales;Authentication=Active Directory Default;Encrypt=True",
+    "Name": "sales",
+    "Tables": [
+      { "Schema": "dbo", "Table": "Orders" },
+      { "Schema": "dbo", "Table": "Customers", "CaptureInstance": "dbo_Customers_v2" }
+    ],
+    "PollInterval": "00:00:00.500",
+    "BatchSize": 1000,
+    "ChannelCapacity": 100000,
+    "StartMode": "FromNow",              // FromNow | FromBeginning
+    "CheckpointMode": "OnAcknowledgement", // OnEmit | OnAcknowledgement
+    "RetryDelay": "00:00:05",
+    "CommandTimeout": "00:00:30",
+    "LeaseName": "sales",                 // setting it turns on single-active-instance
+    "LeaseRetryDelay": "00:00:10",
+    "MaxHandlerAttempts": 3,
+    "HandlerRetryDelay": "00:00:01"
+  }
+}
+```
+
+`Schema` defaults to `dbo`. Any setting left out keeps its default, so a section can be as small
+as a connection string and a table. Mixing is fine — the section is applied first and the
+optional delegate second, so code wins:
+
+```csharp
+builder.Services.AddSqlCdc(
+    builder.Configuration.GetSection("SqlCdc"),
+    cdc => cdc.UseStateStore(new SqlCdcStateStore(connectionString)));
+```
+
+Configuration errors surface when the host starts, not at the first poll: a section that does
+not exist, a table without a name, or a missing connection string all fail `StartAsync`.
+
+### Connections and authentication
+
+`Authentication=Active Directory Default` (or `... Managed Identity`, `... Workload Identity`)
+in the connection string is handled by Microsoft.Data.SqlClient and needs nothing from this
+package.
+
+When the application wants to own how connections are made — a configured `TokenCredential`, a
+`SqlRetryLogicBaseProvider` for Azure SQL's transient faults, a custom `SqlConnectionStringBuilder`
+per tenant — supply a factory. Everything then goes through it: CDC reads, the watermark table,
+the dead-letter table and the lease.
+
+```csharp
+builder.Services.AddSqlCdc(cdc => cdc
+    .UseConnectionFactory(async ct =>
+    {
+        var connection = new SqlConnection(connectionString)
+        {
+            RetryLogicProvider = SqlConfigurableRetryFactory.CreateExponentialRetryProvider(retryOptions),
+        };
+        await connection.OpenAsync(ct);
+        return connection;
+    })
+    .WatchTable("dbo", "Orders"));
+```
+
+The factory must hand out a **new** connection per call — they are opened and disposed per
+operation. Returning a connection that is not open yet is fine; it gets opened for you.
+
+To own only token acquisition, keep the connection string and add a callback:
+
+```csharp
+var credential = new DefaultAzureCredential();
+
+builder.Services.AddSqlCdc(cdc => cdc
+    .UseConnectionString(connectionString)
+    .UseAccessTokenCallback(async (parameters, ct) =>
+    {
+        var token = await credential.GetTokenAsync(
+            new TokenRequestContext(["https://database.windows.net/.default"]), ct);
+        return new SqlAuthenticationToken(token.Token, token.ExpiresOn);
+    })
+    .WatchTable("dbo", "Orders"));
+```
+
+Registering an `ICdcConnectionFactory` in DI is picked up by `AddSqlCdc` automatically, and
+`SqlCdcStateStore`, `SqlCdcDeadLetterSink` and `SqlApplicationLockLeaseProvider` all accept one
+in their constructor.
+
 ### Event model
 
 ```csharp
@@ -125,6 +220,8 @@ record CdcChange
 | `WithLeaseRetryDelay` | 10 s | How often a standby instance retries the lease |
 | `WithHandlerRetry` | 1 attempt | Attempts per handler before a change is dead-lettered |
 | `WithName` | `default` | Name of the watcher in metrics and health data |
+| `UseConnectionFactory` | connection string | Opens every connection through your own factory |
+| `UseAccessTokenCallback` | none | Acquires an Entra ID token per connection |
 
 ## Delivery semantics
 

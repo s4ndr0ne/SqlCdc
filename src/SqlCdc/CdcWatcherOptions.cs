@@ -25,8 +25,11 @@ public enum CdcStartMode
 /// </summary>
 public sealed class CdcWatcherOptions
 {
-    /// <summary>Connection string to the SQL Server database where CDC is enabled.</summary>
-    public required string ConnectionString { get; set; }
+    /// <summary>
+    /// Connection string to the SQL Server database where CDC is enabled. Optional only when an
+    /// <see cref="ICdcConnectionFactory"/> is supplied instead.
+    /// </summary>
+    public string? ConnectionString { get; set; }
 
     /// <summary>Tables to watch.</summary>
     public required IReadOnlyList<CdcTableSubscription> Tables { get; set; }

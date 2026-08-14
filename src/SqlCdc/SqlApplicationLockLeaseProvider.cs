@@ -23,7 +23,7 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
     /// <summary>Application lock resource names are limited to 255 characters by SQL Server.</summary>
     private const int MaxResourceLength = 255;
 
-    private readonly string _connectionString;
+    private readonly ICdcConnectionFactory _connections;
     private readonly string _resource;
     private readonly ILogger _logger;
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -41,8 +41,23 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
         string connectionString,
         string leaseName = DefaultLeaseName,
         ILogger? logger = null)
+        : this(new SqlCdcConnectionFactory(connectionString), leaseName, logger)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+    }
+
+    /// <summary>
+    /// Creates a lease provider that opens its connection through the given factory, so the lease
+    /// authenticates the same way as the rest of the pipeline.
+    /// </summary>
+    /// <param name="connections">Factory for the connection the lease is held on.</param>
+    /// <param name="leaseName">Name shared by the instances that elect a leader between them.</param>
+    /// <param name="logger">Optional logger for lease transitions.</param>
+    public SqlApplicationLockLeaseProvider(
+        ICdcConnectionFactory connections,
+        string leaseName = DefaultLeaseName,
+        ILogger? logger = null)
+    {
+        ArgumentNullException.ThrowIfNull(connections);
         ArgumentException.ThrowIfNullOrWhiteSpace(leaseName);
 
         _resource = $"SqlCdc:{leaseName}";
@@ -55,8 +70,11 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
 
         // Pooling is turned off for this one connection: a pooled connection only releases its
         // session locks when the pool resets it on the next use, which would delay failover after
-        // a graceful stop. Unpooled, closing the connection ends the session immediately.
-        _connectionString = new SqlConnectionStringBuilder(connectionString) { Pooling = false }.ConnectionString;
+        // a graceful stop. Unpooled, closing the connection ends the session immediately. A custom
+        // factory owns its own connection string, so there the explicit release has to carry it.
+        _connections = connections is SqlCdcConnectionFactory sqlFactory
+            ? sqlFactory.WithConnectionString(b => b.Pooling = false)
+            : connections;
         _logger = logger ?? NullLogger<SqlApplicationLockLeaseProvider>.Instance;
     }
 
@@ -75,11 +93,9 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
                 return true;
             }
 
-            var connection = new SqlConnection(_connectionString);
+            var connection = await _connections.OpenConnectionAsync(cancellationToken);
             try
             {
-                await connection.OpenAsync(cancellationToken);
-
                 await using var cmd = new SqlCommand("sys.sp_getapplock", connection)
                 {
                     CommandType = CommandType.StoredProcedure,

@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -22,8 +23,50 @@ public static class SqlCdcServiceCollectionExtensions
     /// </remarks>
     public static IServiceCollection AddSqlCdc(this IServiceCollection services, Action<SqlCdcWatcherBuilder> configure)
     {
-        ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configure);
+
+        return AddSqlCdcCore(services, configuration: null, configure);
+    }
+
+    /// <summary>
+    /// Registers the watcher from a configuration section, so connection strings and tuning live
+    /// in appsettings, environment variables or a secret store rather than in code.
+    /// </summary>
+    /// <param name="services">The service collection.</param>
+    /// <param name="configuration">
+    /// The <c>SqlCdc</c> section, for example <c>builder.Configuration.GetSection("SqlCdc")</c>.
+    /// See <see cref="SqlCdcConfiguration"/> for the shape it is bound to.
+    /// </param>
+    /// <param name="configure">
+    /// Optional extra configuration, applied after the section — use it for anything that cannot
+    /// be expressed in configuration, such as a state store instance. Settings made here win.
+    /// </param>
+    /// <remarks>
+    /// The watcher is built when the host starts, so a section that is missing a connection
+    /// string or a table fails startup rather than failing quietly at the first poll.
+    /// </remarks>
+    public static IServiceCollection AddSqlCdc(
+        this IServiceCollection services,
+        IConfiguration configuration,
+        Action<SqlCdcWatcherBuilder>? configure = null)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        if (configuration is IConfigurationSection section && !section.Exists())
+        {
+            throw new InvalidOperationException(
+                $"The configuration section '{section.Path}' does not exist. Add it, or configure SqlCdc in code.");
+        }
+
+        return AddSqlCdcCore(services, configuration, configure);
+    }
+
+    private static IServiceCollection AddSqlCdcCore(
+        IServiceCollection services,
+        IConfiguration? configuration,
+        Action<SqlCdcWatcherBuilder>? configure)
+    {
+        ArgumentNullException.ThrowIfNull(services);
 
         services.TryAddSingleton(sp =>
         {
@@ -47,8 +90,16 @@ public static class SqlCdcServiceCollectionExtensions
                 builder.UseLeaseProvider(leaseProvider);
             }
 
-            // Applied last so explicit configuration wins over what was resolved from the container.
-            configure(builder);
+            var connectionFactory = sp.GetService<ICdcConnectionFactory>();
+            if (connectionFactory is not null)
+            {
+                builder.UseConnectionFactory(connectionFactory);
+            }
+
+            // Configuration first, then the delegate: code wins over the section, and both win
+            // over what was resolved from the container.
+            configuration?.Get<SqlCdcConfiguration>()?.ApplyTo(builder);
+            configure?.Invoke(builder);
             return builder.Build();
         });
 

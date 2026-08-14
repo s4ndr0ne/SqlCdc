@@ -84,6 +84,43 @@ public class BuilderTests
     }
 
     [Fact]
+    public async Task AConnectionFactory_ReplacesTheConnectionString()
+    {
+        // Nothing connects until StartAsync, so building proves the factory satisfies the
+        // requirement that a connection string otherwise carries.
+        await using var watcher = SqlCdcWatcherBuilder
+            .Create()
+            .UseConnectionFactory(_ => Task.FromResult(new Microsoft.Data.SqlClient.SqlConnection()))
+            .WatchTable("dbo", "Orders")
+            .Build();
+
+        Assert.Null(watcher.Options.ConnectionString);
+    }
+
+    [Fact]
+    public void WithoutAConnectionStringOrFactory_TheErrorNamesBoth()
+    {
+        var builder = SqlCdcWatcherBuilder.Create().WatchTable("dbo", "Orders");
+
+        var error = Assert.Throws<InvalidOperationException>(() => builder.Build());
+
+        Assert.Contains("UseConnectionString", error.Message);
+        Assert.Contains("UseConnectionFactory", error.Message);
+    }
+
+    [Fact]
+    public void AnAccessTokenCallback_CannotBeCombinedWithACustomFactory()
+    {
+        var builder = SqlCdcWatcherBuilder
+            .Create()
+            .WatchTable("dbo", "Orders")
+            .UseConnectionFactory(_ => Task.FromResult(new Microsoft.Data.SqlClient.SqlConnection()))
+            .UseAccessTokenCallback((_, _) => throw new NotSupportedException());
+
+        Assert.Throws<InvalidOperationException>(() => builder.Build());
+    }
+
+    [Fact]
     public void UseSingleActiveInstance_WithBlankLeaseName_Throws()
     {
         var builder = SqlCdcWatcherBuilder.Create();

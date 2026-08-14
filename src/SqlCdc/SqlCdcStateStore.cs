@@ -8,15 +8,29 @@ namespace SqlCdc;
 /// </summary>
 public sealed class SqlCdcStateStore : ICdcStateStore
 {
-    private readonly string _connectionString;
+    private readonly ICdcConnectionFactory _connections;
     private readonly string _schema;
     private readonly string _table;
     private readonly SemaphoreSlim _ensureLock = new(1, 1);
     private bool _tableEnsured;
 
     public SqlCdcStateStore(string connectionString, string schema = "dbo", string table = "cdc_watermark")
+        : this(new SqlCdcConnectionFactory(connectionString), schema, table)
     {
-        _connectionString = connectionString;
+    }
+
+    /// <summary>
+    /// Uses the given factory to open its connections, so the watermark table is reached the same
+    /// way as the CDC tables — same credentials, same token, same retry configuration.
+    /// </summary>
+    public SqlCdcStateStore(
+        ICdcConnectionFactory connections,
+        string schema = "dbo",
+        string table = "cdc_watermark")
+    {
+        ArgumentNullException.ThrowIfNull(connections);
+
+        _connections = connections;
         _schema = schema;
         _table = table;
     }
@@ -31,8 +45,7 @@ public sealed class SqlCdcStateStore : ICdcStateStore
             await EnsureTableAsync(cancellationToken);
             try
             {
-                await using var conn = new SqlConnection(_connectionString);
-                await conn.OpenAsync(cancellationToken);
+                await using var conn = await _connections.OpenConnectionAsync(cancellationToken);
                 string sql =
                     $"SELECT LastLsn FROM {TableName} WHERE CaptureInstance = @ci;";
                 await using var cmd = new SqlCommand(sql, conn);
@@ -54,8 +67,7 @@ public sealed class SqlCdcStateStore : ICdcStateStore
             await EnsureTableAsync(cancellationToken);
             try
             {
-                await using var conn = new SqlConnection(_connectionString);
-                await conn.OpenAsync(cancellationToken);
+                await using var conn = await _connections.OpenConnectionAsync(cancellationToken);
                 string sql =
                     $"""
                      IF EXISTS (SELECT 1 FROM {TableName} WHERE CaptureInstance = @ci)
@@ -93,8 +105,7 @@ public sealed class SqlCdcStateStore : ICdcStateStore
                 return;
             }
 
-            await using var conn = new SqlConnection(_connectionString);
-            await conn.OpenAsync(cancellationToken);
+            await using var conn = await _connections.OpenConnectionAsync(cancellationToken);
             string sql =
                 $"""
                  IF OBJECT_ID(@tableName, N'U') IS NULL

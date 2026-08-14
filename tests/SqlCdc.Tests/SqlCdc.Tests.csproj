@@ -27,4 +27,14 @@
     <None Update="PublicApi.approved.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Where the approval files live. It cannot come from [CallerFilePath]: a CI build sets
+         ContinuousIntegrationBuild, which rewrites source paths to /_/ so that builds are
+         deterministic, and that path does not exist on disk. -->
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>ProjectDirectory</_Parameter1>
+      <_Parameter2>$(MSBuildProjectDirectory)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
 </Project>

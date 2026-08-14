@@ -1,0 +1,56 @@
+<Project>
+
+  <!-- Settings shared by every project. Package metadata that differs per package stays in the
+       individual .csproj; everything a consumer or a build server relies on lives here. -->
+  <PropertyGroup>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AnalysisLevel>latest</AnalysisLevel>
+
+    <!-- A warning that nobody has to act on is a warning everybody learns to scroll past. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+
+    <!-- Packing is opt-in: only the library produces a package. -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <Authors>s4ndr0ne</Authors>
+    <Company>s4ndr0ne</Company>
+    <Copyright>Copyright © s4ndr0ne</Copyright>
+    <PackageProjectUrl>https://github.com/s4ndr0ne/SqlCdc</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/s4ndr0ne/SqlCdc</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+  <!-- Debuggability of the shipped package: portable PDBs in a .snupkg, sources resolvable from
+       GitHub through SourceLink (built into the SDK), and sources that git does not track — such
+       as generated files — embedded so they resolve too. -->
+  <PropertyGroup>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+
+  <!-- Deterministic builds only pay off when the source paths are normalised, which is what
+       ContinuousIntegrationBuild does. Setting it locally would break the debugger's ability to
+       find local sources, so it is limited to the build server. -->
+  <PropertyGroup Condition="'$(GITHUB_ACTIONS)' == 'true'">
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <!-- The version comes from the nearest v* git tag, so a release is a tag and nothing else has
+       to be edited. Untagged commits get a pre-release version above the last tag. -->
+  <PropertyGroup>
+    <MinVerTagPrefix>v</MinVerTagPrefix>
+    <MinVerMinimumMajorMinor>1.0</MinVerMinimumMajorMinor>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MinVer" PrivateAssets="all" IncludeAssets="runtime; build; native; contentfiles; analyzers; buildtransitive" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,65 @@
+name: Bug report
+description: Something does not behave as documented
+labels: [ bug ]
+
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: >
+        The watcher configuration (builder calls or the SqlCdc section, with secrets removed),
+        what you did to the source table, and what the consumer saw.
+      render: csharp
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: SqlCdc version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+
+  - type: input
+    id: sqlserver
+    attributes:
+      label: SQL Server version and edition
+      description: "`SELECT @@VERSION`, or Azure SQL / Managed Instance."
+    validations:
+      required: true
+
+  - type: input
+    id: dotnet
+    attributes:
+      label: .NET version
+      placeholder: "net8.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: >
+        The library logs a warning or error for every situation it handles rather than throws.
+        Anything from the SqlCdc categories helps.
+      render: text
+
+  - type: checkboxes
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - label: More than one instance runs against this database
+        - label: Single active instance (lease) is enabled
+        - label: Checkpoint mode is OnAcknowledgement

@@ -1,56 +1,65 @@
-# This workflow creates a GitHub release and attaches the nuget package.
-name: Create GitHub Release
+# Builds, tests and packs a v* tag, then creates the GitHub release with the package attached.
+#
+# The version comes from the tag itself through MinVer. Publishing to NuGet is deliberately not
+# automated: download the .nupkg from the release and push it by hand when you are ready.
+name: Release
 
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
-  
+
+permissions:
+  contents: read
 
 env:
+  DOTNET_NOLOGO: true
   PROJECT_PATH: src/SqlCdc/SqlCdc.csproj
-  TEST_PROJECT_PATH: tests/SqlCdc.Tests/SqlCdc.Tests.csproj
-  
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    environment: production
     permissions:
       contents: write
-    environment: production
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Without the full history MinVer cannot see the tag and would version the package as a
+          # pre-release of 1.0 — a silently wrong release.
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: |
+            8.0.x
+            10.0.x
 
-      - name: Restore dependencies
+      - name: Restore
         run: dotnet restore
 
       - name: Build
         run: dotnet build --configuration Release --no-restore
-      
-      - name: Test
-        run: dotnet test ${{ env.TEST_PROJECT_PATH }} -c Release --no-build --verbosity normal
+
+      - name: Unit tests
+        run: dotnet test tests/SqlCdc.Tests --configuration Release --no-build
+
+      - name: Integration tests
+        run: dotnet test tests/SqlCdc.IntegrationTests --configuration Release --no-build
 
       - name: Pack
-        run: dotnet pack ${{ env.PROJECT_PATH }} --configuration Release --no-build -o ./artifacts      
+        run: dotnet pack ${{ env.PROJECT_PATH }} --configuration Release --no-build -o ./artifacts
 
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
         with:
-          files: ./artifacts/*.nupkg
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create Release Symbols
-        id: create_release_symbols
-        uses: softprops/action-gh-release@v1
-        with:
-          files: ./artifacts/*.snupkg
+          files: |
+            ./artifacts/*.nupkg
+            ./artifacts/*.snupkg
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

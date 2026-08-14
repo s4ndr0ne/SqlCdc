@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest a capability the library does not have
+labels: [ enhancement ]
+
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that the library makes hard or impossible?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: If you have an API shape in mind, sketch it here.
+      render: csharp
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Workarounds you are using today, and why they are not enough.

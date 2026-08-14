@@ -1,5 +1,10 @@
 # SqlCdc
 
+[![CI](https://github.com/s4ndr0ne/SqlCdc/actions/workflows/dotnet.yml/badge.svg)](https://github.com/s4ndr0ne/SqlCdc/actions/workflows/dotnet.yml)
+[![NuGet](https://img.shields.io/nuget/v/s4ndr0ne.SqlCdc.svg)](https://www.nuget.org/packages/s4ndr0ne.SqlCdc)
+[![Downloads](https://img.shields.io/nuget/dt/s4ndr0ne.SqlCdc.svg)](https://www.nuget.org/packages/s4ndr0ne.SqlCdc)
+[![License](https://img.shields.io/github/license/s4ndr0ne/SqlCdc.svg)](LICENSE)
+
 Real-time Change Data Capture (CDC) for **SQL Server**, built on top of native CDC.
 The package polls capture instances (`cdc.fn_cdc_get_all_changes_*`), reconstructs
 events (insert/update/delete with *before*/*after* images) and delivers them over a
@@ -442,10 +447,18 @@ snapshot is available programmatically from `SqlCdcWatcher.GetStatus()`.
 ```bash
 dotnet restore
 dotnet build SqlCdc.slnx
-dotnet test tests/SqlCdc.Tests                    # unit tests, no external dependencies
+dotnet test tests/SqlCdc.Tests -f net10.0         # unit tests, no external dependencies
 dotnet test tests/SqlCdc.IntegrationTests         # requires Docker (see below)
 dotnet pack src/SqlCdc/SqlCdc.csproj -c Release   # build NuGet package
 ```
+
+The unit tests also target `net8.0`, which needs the .NET 8 runtime installed next to the .NET 10
+SDK — hence the `-f net10.0` above. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow,
+including how to accept a public API change and how releases are cut.
+
+The package version comes from the git tag (MinVer), so a release is a `v*` tag and nothing else.
+`dotnet pack` validates the result against the last published version and fails on an accidental
+breaking change.
 
 ### Integration tests
 

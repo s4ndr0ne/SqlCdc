@@ -1,0 +1,45 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!-- https://learn.microsoft.com/dotnet/fundamentals/package-validation/diagnostic-ids
+
+     Binary breaking changes against the 1.0.0 baseline, accepted on the way to the next major:
+
+     - SqlCdcStateStore(string, string, string): the constructor gained optional parameters
+       (createTableIfMissing, commandTimeout). Optional parameters are source compatible but not
+       binary compatible — an assembly compiled against 1.0.0 calls the three-argument overload.
+     - SqlCdcWatcher.StopAsync(): gained a CancellationToken, same story.
+
+     Both are listed in CHANGELOG.md. Once the next major ships, raise
+     PackageValidationBaselineVersion to it and delete this file: anything still reported then is
+     a new break, not one that was already accounted for.
+-->
+
+<Suppressions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <Suppression>
+    <DiagnosticId>CP0002</DiagnosticId>
+    <Target>M:SqlCdc.SqlCdcStateStore.#ctor(System.String,System.String,System.String)</Target>
+    <Left>lib/net10.0/SqlCdc.dll</Left>
+    <Right>lib/net10.0/SqlCdc.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <DiagnosticId>CP0002</DiagnosticId>
+    <Target>M:SqlCdc.SqlCdcWatcher.StopAsync</Target>
+    <Left>lib/net10.0/SqlCdc.dll</Left>
+    <Right>lib/net10.0/SqlCdc.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <DiagnosticId>CP0002</DiagnosticId>
+    <Target>M:SqlCdc.SqlCdcStateStore.#ctor(System.String,System.String,System.String)</Target>
+    <Left>lib/net8.0/SqlCdc.dll</Left>
+    <Right>lib/net8.0/SqlCdc.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <DiagnosticId>CP0002</DiagnosticId>
+    <Target>M:SqlCdc.SqlCdcWatcher.StopAsync</Target>
+    <Left>lib/net8.0/SqlCdc.dll</Left>
+    <Right>lib/net8.0/SqlCdc.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+</Suppressions>

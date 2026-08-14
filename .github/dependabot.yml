@@ -1,0 +1,27 @@
+version: 2
+
+updates:
+  # Versions live in Directory.Packages.props; Dependabot edits it directly.
+  - package-ecosystem: nuget
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One pull request for the Microsoft.Extensions.* family: they ship together and are meant
+      # to move together, so separate PRs would just be five ways to end up mismatched.
+      microsoft-extensions:
+        patterns:
+          - "Microsoft.Extensions.*"
+      test-dependencies:
+        patterns:
+          - "xunit*"
+          - "Microsoft.NET.Test.Sdk"
+          - "Testcontainers*"
+          - "coverlet.*"
+          - "PublicApiGenerator"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

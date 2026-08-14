@@ -480,3 +480,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Public API approval: the received file is a build output, the approved one is source.
+tests/**/PublicApi.received.txt

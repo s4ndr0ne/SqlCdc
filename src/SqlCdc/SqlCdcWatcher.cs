@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Data;
+using System.Diagnostics;
 using System.Threading.Channels;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
@@ -16,16 +17,28 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// <summary>Number of LSNs mapped to commit times in a single round-trip.</summary>
     private const int LsnTimeMapChunkSize = 500;
 
+    /// <summary>How long to wait for a batch to be acknowledged before warning that polling is stalled.</summary>
+    private static readonly TimeSpan CheckpointWarningInterval = TimeSpan.FromSeconds(30);
+
     private readonly CdcWatcherOptions _options;
     private readonly ICdcStateStore _stateStore;
+    private readonly ICdcLeaseProvider _leaseProvider;
+    private readonly bool _ownsLeaseProvider;
     private readonly ILogger _logger;
     private Channel<CdcChange> _channel;
     private readonly ConcurrentDictionary<string, TableRuntime> _tables = new();
     private readonly SemaphoreSlim _stateLock = new(1, 1);
     private CancellationTokenSource? _cts;
     private Task? _pollTask;
+    private volatile bool _isLeader;
+    private bool _standbyLogged;
 
-    internal SqlCdcWatcher(CdcWatcherOptions options, ICdcStateStore stateStore, ILogger? logger = null)
+    internal SqlCdcWatcher(
+        CdcWatcherOptions options,
+        ICdcStateStore stateStore,
+        ILogger? logger = null,
+        ICdcLeaseProvider? leaseProvider = null,
+        bool ownsLeaseProvider = false)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(stateStore);
@@ -55,12 +68,38 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             throw new ArgumentOutOfRangeException(nameof(options), "CommandTimeout must be positive.");
         }
 
+        if (options.LeaseRetryDelay <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "LeaseRetryDelay must be positive.");
+        }
+
+        if (string.IsNullOrWhiteSpace(options.Name))
+        {
+            throw new ArgumentException("Name must not be empty.", nameof(options));
+        }
+
+        if (options.MaxHandlerAttempts < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "MaxHandlerAttempts must be at least 1.");
+        }
+
+        if (options.HandlerRetryDelay <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "HandlerRetryDelay must be positive.");
+        }
+
         _options = options;
         _stateStore = stateStore;
+        _leaseProvider = leaseProvider ?? NullCdcLeaseProvider.Instance;
+        _ownsLeaseProvider = ownsLeaseProvider && leaseProvider is not null;
         _logger = logger ?? NullLogger<SqlCdcWatcher>.Instance;
 
         _channel = CreateChannel();
+        SqlCdcDiagnostics.Register(this);
     }
+
+    /// <summary>Name identifying this watcher in metrics and health data.</summary>
+    public string Name => _options.Name;
 
     /// <summary>The effective options for this watcher.</summary>
     internal CdcWatcherOptions Options => _options;
@@ -76,6 +115,12 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
     /// <summary>True while the polling loop is running.</summary>
     public bool IsRunning => _pollTask is { IsCompleted: false };
+
+    /// <summary>
+    /// True while this instance holds the lease and is therefore the one polling. Always true when
+    /// no lease provider is configured; false on a standby instance waiting to take over.
+    /// </summary>
+    public bool IsLeader => _isLeader;
 
     /// <summary>
     /// Resolves the capture instances for the configured tables and starts the polling loop.
@@ -103,8 +148,9 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             _tables.Clear();
             foreach (var subscription in _options.Tables)
             {
+                // Watermarks are not read here: they are loaded once the lease is held, because a
+                // standby instance must not act on a watermark the active one has since advanced.
                 var runtime = await ResolveTableAsync(subscription, cancellationToken);
-                runtime.Watermark = await _stateStore.GetLastLsnAsync(runtime.CaptureInstance, cancellationToken);
                 _tables[runtime.CaptureInstance] = runtime;
             }
 
@@ -112,6 +158,9 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             {
                 throw new InvalidOperationException("No CDC tables were resolved. Is CDC enabled for the configured tables?");
             }
+
+            _isLeader = false;
+            _standbyLogged = false;
 
             var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             var token = cts.Token;
@@ -160,6 +209,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 _cts = null;
                 _pollTask = null;
             }
+
+            await ReleaseLeaseAsync(cancellationToken);
         }
         finally
         {
@@ -170,6 +221,65 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await StopAsync();
+
+        if (_ownsLeaseProvider)
+        {
+            await _leaseProvider.DisposeAsync();
+        }
+
+        SqlCdcDiagnostics.Unregister(this);
+        _stateLock.Dispose();
+    }
+
+    /// <summary>
+    /// Takes a snapshot of what the watcher is doing: whether it is polling, whether it holds the
+    /// lease, and per capture instance the failure count, last successful poll and changes emitted.
+    /// Reads counters the polling loop already maintains, so it is cheap enough for a health probe.
+    /// </summary>
+    public CdcWatcherStatus GetStatus()
+    {
+        var tables = _tables.Values
+            .Select(t => new CdcTableStatus(
+                t.CaptureInstance,
+                t.Schema,
+                t.Table,
+                t.ConsecutiveFailures,
+                t.LastSuccessfulPoll,
+                t.LastEmittedCommitTime,
+                Interlocked.Read(ref t.ChangesEmitted)))
+            .OrderBy(t => t.CaptureInstance, StringComparer.Ordinal)
+            .ToList();
+
+        return new CdcWatcherStatus(Name, IsRunning, IsLeader, _channel.Reader.Count, tables);
+    }
+
+    /// <summary>
+    /// Hands the lease back so a standby instance can take over immediately instead of waiting for
+    /// SQL Server to notice the session is gone.
+    /// </summary>
+    private async Task ReleaseLeaseAsync(CancellationToken cancellationToken)
+    {
+        if (!_isLeader)
+        {
+            return;
+        }
+
+        _isLeader = false;
+        try
+        {
+            await _leaseProvider.ReleaseAsync(cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            // A shutdown too short to release cleanly: the lease still goes away with the process,
+            // it just takes SQL Server a little longer to notice.
+            _logger.LogDebug("Stopping was cancelled before the CDC lease could be released.");
+        }
+        catch (Exception ex)
+        {
+            // Dropping the lease connection releases it anyway; failing to stop would be worse.
+            _logger.LogWarning(ex, "Releasing the CDC lease failed.");
+        }
     }
 
     private Channel<CdcChange> CreateChannel() =>
@@ -186,6 +296,12 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         {
             while (!ct.IsCancellationRequested)
             {
+                if (!await EnsureLeadershipAsync(ct))
+                {
+                    await Task.Delay(_options.LeaseRetryDelay, ct);
+                    continue;
+                }
+
                 foreach (var table in _tables.Values)
                 {
                     if (ct.IsCancellationRequested)
@@ -200,11 +316,20 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                         continue;
                     }
 
+                    using var activity = SqlCdcDiagnostics.ActivitySource.StartActivity(
+                        "SqlCdc.Poll", ActivityKind.Client);
+                    activity?.SetTag("watcher", _options.Name);
+                    activity?.SetTag("capture_instance", table.CaptureInstance);
+                    var startedAt = Stopwatch.GetTimestamp();
+
                     try
                     {
-                        await PollTableAsync(table, ct);
+                        await PollTableAsync(table, ct, activity);
                         table.ConsecutiveFailures = 0;
                         table.NextAttemptTick = 0;
+                        table.LastSuccessfulPoll = DateTimeOffset.UtcNow;
+                        SqlCdcDiagnostics.PollDuration.Record(
+                            Stopwatch.GetElapsedTime(startedAt).TotalSeconds, TableTags(table));
                     }
                     catch (OperationCanceledException) when (ct.IsCancellationRequested)
                     {
@@ -213,6 +338,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     catch (Exception ex)
                     {
                         table.ConsecutiveFailures++;
+                        activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                        SqlCdcDiagnostics.PollFailures.Add(1, TableTags(table));
                         var retryMs = _options.RetryDelay.TotalMilliseconds;
                         table.NextAttemptTick = retryMs > long.MaxValue - Environment.TickCount64
                             ? long.MaxValue
@@ -246,7 +373,82 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         }
     }
 
-    private async Task PollTableAsync(TableRuntime table, CancellationToken ct)
+    /// <summary>
+    /// Gates polling on the lease. Returns false when this instance must stand by, in which case
+    /// the caller backs off for <see cref="CdcWatcherOptions.LeaseRetryDelay"/> before asking again.
+    /// </summary>
+    private async Task<bool> EnsureLeadershipAsync(CancellationToken ct)
+    {
+        try
+        {
+            if (_isLeader)
+            {
+                if (await _leaseProvider.IsHeldAsync(ct))
+                {
+                    return true;
+                }
+
+                _isLeader = false;
+                _standbyLogged = false;
+                _logger.LogWarning(
+                    "Lost the CDC lease; polling is paused until it is re-acquired. " +
+                    "Another instance may have taken over.");
+                return false;
+            }
+
+            if (!await _leaseProvider.TryAcquireAsync(ct))
+            {
+                if (!_standbyLogged)
+                {
+                    _standbyLogged = true;
+                    _logger.LogInformation(
+                        "Another instance holds the CDC lease; standing by and retrying every {LeaseRetryDelay}.",
+                        _options.LeaseRetryDelay);
+                }
+
+                return false;
+            }
+
+            // Read the watermarks only now: while this instance was standing by, the active one
+            // advanced them, and resuming from a stale watermark would replay everything since.
+            await LoadWatermarksAsync(ct);
+
+            _isLeader = true;
+            _standbyLogged = false;
+            _logger.LogInformation("Acquired the CDC lease; this instance is now the active watcher.");
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _isLeader = false;
+            _logger.LogError(
+                ex,
+                "Could not establish the CDC lease; retrying in {LeaseRetryDelay}. No change events are being delivered.",
+                _options.LeaseRetryDelay);
+            return false;
+        }
+    }
+
+    /// <summary>Reloads every table's watermark from the state store.</summary>
+    private async Task LoadWatermarksAsync(CancellationToken ct)
+    {
+        foreach (var table in _tables.Values)
+        {
+            table.Watermark = await _stateStore.GetLastLsnAsync(table.CaptureInstance, ct);
+        }
+    }
+
+    private TagList TableTags(TableRuntime table) => new()
+    {
+        { "watcher", _options.Name },
+        { "capture_instance", table.CaptureInstance },
+    };
+
+    private async Task PollTableAsync(TableRuntime table, CancellationToken ct, Activity? activity = null)
     {
         var (maxLsn, minLsn) = await GetLogBoundsAsync(table.CaptureInstance, ct);
         if (maxLsn is null)
@@ -303,11 +505,33 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             var batch = await ReadChangesAsync(table, cursor, maxLsn, ct);
             if (batch.Rows.Count > 0 && batch.FullyConsumedLsn is not null)
             {
-                var timeMap = await MapLsnToTimeAsync(batch.Rows.Select(r => r.Lsn), ct);
+                SqlCdcDiagnostics.BatchRows.Record(batch.Rows.Count, TableTags(table));
+
+                var (timeMap, serverTime) = await MapLsnToTimeAsync(batch.Rows.Select(r => r.Lsn), ct);
+                var barrier = _options.CheckpointMode == CdcCheckpointMode.OnAcknowledgement
+                    ? new CheckpointBarrier()
+                    : null;
+                var emitted = 0;
+
                 foreach (var change in CdcChangePairer.Pair(
                     table.Schema, table.Table, table.CaptureInstance, table.CapturedColumns, batch.Rows, timeMap))
                 {
-                    await _channel.Writer.WriteAsync(change, ct);
+                    // Registered before the change is written: once it is on the channel a consumer
+                    // can acknowledge it at any moment, and the barrier must already know about it.
+                    var published = barrier is null ? change : change with { Acknowledgement = barrier.Register() };
+                    await _channel.Writer.WriteAsync(published, ct);
+
+                    emitted++;
+                    RecordEmitted(table, published, serverTime);
+                }
+
+                Interlocked.Add(ref table.ChangesEmitted, emitted);
+                activity?.SetTag("changes", emitted);
+
+                if (barrier is not null)
+                {
+                    barrier.Seal();
+                    await WaitForAcknowledgementsAsync(table, barrier, ct);
                 }
 
                 table.Watermark = batch.FullyConsumedLsn;
@@ -318,6 +542,61 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             if (!batch.HitCap || table.Watermark is null || LsnHelpers.Compare(table.Watermark, maxLsn) >= 0)
             {
                 break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Counts an emitted change and records how far behind the source it was. Lag is measured
+    /// entirely on the SQL Server clock: <c>fn_cdc_map_lsn_to_time</c> reports the server's local
+    /// time, so subtracting the client's UTC would measure the time zone offset instead.
+    /// </summary>
+    private void RecordEmitted(TableRuntime table, CdcChange change, DateTime? serverTime)
+    {
+        var tags = TableTags(table);
+        tags.Add("operation", change.Operation.ToString());
+        SqlCdcDiagnostics.ChangesEmitted.Add(1, tags);
+
+        if (change.CommitTime == default)
+        {
+            return;
+        }
+
+        table.LastEmittedCommitTime = change.CommitTime;
+
+        if (serverTime is not null)
+        {
+            var lag = serverTime.Value - change.CommitTime;
+            if (lag > TimeSpan.Zero)
+            {
+                SqlCdcDiagnostics.ChangeLag.Record(lag.TotalSeconds, TableTags(table));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Waits for the whole batch to be acknowledged before its watermark is persisted. A consumer
+    /// that never acknowledges pauses polling for that table indefinitely, so the wait is reported
+    /// periodically rather than left silent.
+    /// </summary>
+    private async Task WaitForAcknowledgementsAsync(TableRuntime table, CheckpointBarrier barrier, CancellationToken ct)
+    {
+        var waited = TimeSpan.Zero;
+        while (true)
+        {
+            try
+            {
+                await barrier.Completion.WaitAsync(CheckpointWarningInterval, ct);
+                return;
+            }
+            catch (TimeoutException)
+            {
+                waited += CheckpointWarningInterval;
+                _logger.LogWarning(
+                    "Capture instance {CaptureInstance}: still waiting after {Waited} for the current batch to be " +
+                    "acknowledged. The watermark cannot advance and polling is paused for this table. Is every " +
+                    "change acknowledged with CdcChange.Acknowledge()?",
+                    table.CaptureInstance, waited);
             }
         }
     }
@@ -500,10 +779,17 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         return (minLsn, null);
     }
 
-    private async Task<Dictionary<string, DateTime>> MapLsnToTimeAsync(IEnumerable<byte[]> lsns, CancellationToken ct)
+    /// <summary>
+    /// Maps LSNs to their commit times, and reports the server's own clock alongside them so lag
+    /// can be computed without knowing the server's time zone.
+    /// </summary>
+    private async Task<(Dictionary<string, DateTime> TimeMap, DateTime? ServerTime)> MapLsnToTimeAsync(
+        IEnumerable<byte[]> lsns,
+        CancellationToken ct)
     {
         var result = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         var distinct = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        DateTime? serverTime = null;
         foreach (var lsn in lsns)
         {
             distinct.TryAdd(Convert.ToHexString(lsn), lsn);
@@ -511,7 +797,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
         if (distinct.Count == 0)
         {
-            return result;
+            return (result, serverTime);
         }
 
         await using var conn = new SqlConnection(_options.ConnectionString);
@@ -523,7 +809,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         {
             var tuples = string.Join(",", Enumerable.Range(0, chunk.Length).Select(i => $"(@l{i})"));
             await using var cmd = new SqlCommand(
-                $"SELECT v.lsn, sys.fn_cdc_map_lsn_to_time(v.lsn) FROM (VALUES {tuples}) AS v(lsn);", conn);
+                $"SELECT v.lsn, sys.fn_cdc_map_lsn_to_time(v.lsn), SYSDATETIME() " +
+                $"FROM (VALUES {tuples}) AS v(lsn);", conn);
             cmd.CommandTimeout = CommandTimeoutSeconds;
             for (var i = 0; i < chunk.Length; i++)
             {
@@ -533,6 +820,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             await using var reader = await cmd.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
             {
+                serverTime = reader.GetDateTime(2);
+
                 if (await reader.IsDBNullAsync(1, ct))
                 {
                     continue;
@@ -542,7 +831,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             }
         }
 
-        return result;
+        return (result, serverTime);
     }
 
     private sealed class TableRuntime
@@ -555,11 +844,20 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             CapturedColumns = capturedColumns;
         }
 
+        /// <summary>Changes emitted for this capture instance; read from other threads by GetStatus.</summary>
+        public long ChangesEmitted;
+
         public string Schema { get; }
         public string Table { get; }
         public string CaptureInstance { get; }
         public IReadOnlyList<string> CapturedColumns { get; }
         public byte[]? Watermark { get; set; }
+
+        /// <summary>When this capture instance was last polled without error.</summary>
+        public DateTimeOffset? LastSuccessfulPoll { get; set; }
+
+        /// <summary>Commit time of the last change emitted, in SQL Server local time.</summary>
+        public DateTime? LastEmittedCommitTime { get; set; }
 
         /// <summary>Failed polls in a row for this table; reset on the first success.</summary>
         public int ConsecutiveFailures { get; set; }

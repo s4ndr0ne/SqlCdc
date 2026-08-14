@@ -36,9 +36,23 @@ public sealed record CdcChange
     /// <summary>For updates, which columns were actually modified (keyed by column name).</summary>
     public required IReadOnlyDictionary<string, bool> UpdateMask { get; init; }
 
+    /// <summary>
+    /// Acknowledgement handle, set only when the watcher runs in
+    /// <see cref="CdcCheckpointMode.OnAcknowledgement"/>.
+    /// </summary>
+    internal ChangeAcknowledgement? Acknowledgement { get; init; }
+
     /// <summary>Stable per-change identifier, combining LSN and sequence value.</summary>
     public string Key => $"{Convert.ToHexString(StartLsn)}-{Convert.ToHexString(SeqVal)}";
 
     /// <summary>Fully qualified source table name, e.g. <c>[dbo].[Orders]</c>.</summary>
     public string TableName => $"[{SourceSchema}].[{SourceTable}]";
+
+    /// <summary>
+    /// Marks this change as processed. Required for every change when the watcher runs in
+    /// <see cref="CdcCheckpointMode.OnAcknowledgement"/> — the watermark only advances past a
+    /// batch once all of its changes are acknowledged, so a skipped call stalls polling. A no-op
+    /// in <see cref="CdcCheckpointMode.OnEmit"/>, and acknowledging twice counts once.
+    /// </summary>
+    public void Acknowledge() => Acknowledgement?.Acknowledge();
 }

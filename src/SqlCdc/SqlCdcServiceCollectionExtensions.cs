@@ -41,6 +41,12 @@ public static class SqlCdcServiceCollectionExtensions
                 builder.UseStateStore(stateStore);
             }
 
+            var leaseProvider = sp.GetService<ICdcLeaseProvider>();
+            if (leaseProvider is not null)
+            {
+                builder.UseLeaseProvider(leaseProvider);
+            }
+
             // Applied last so explicit configuration wins over what was resolved from the container.
             configure(builder);
             return builder.Build();
@@ -59,6 +65,28 @@ public static class SqlCdcServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
         services.AddScoped<ICdcChangeHandler, THandler>();
+        return services;
+    }
+
+    /// <summary>
+    /// Registers where changes go when a handler has used up its attempts. Without a sink they are
+    /// logged and dropped. Pair it with <see cref="SqlCdcWatcherBuilder.WithHandlerRetry"/>.
+    /// </summary>
+    public static IServiceCollection AddCdcDeadLetterSink<TSink>(this IServiceCollection services)
+        where TSink : class, ICdcDeadLetterSink
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        services.TryAddSingleton<ICdcDeadLetterSink, TSink>();
+        return services;
+    }
+
+    /// <inheritdoc cref="AddCdcDeadLetterSink{TSink}(IServiceCollection)"/>
+    public static IServiceCollection AddCdcDeadLetterSink(this IServiceCollection services, ICdcDeadLetterSink sink)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(sink);
+
+        services.TryAddSingleton(sink);
         return services;
     }
 }

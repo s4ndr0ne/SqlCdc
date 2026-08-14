@@ -48,4 +48,33 @@ public sealed class CdcWatcherOptions
 
     /// <summary>Timeout for each SQL round-trip against the CDC database. Defaults to 30 seconds.</summary>
     public TimeSpan CommandTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// When the watermark LSN is persisted. Defaults to <see cref="CdcCheckpointMode.OnEmit"/>.
+    /// </summary>
+    public CdcCheckpointMode CheckpointMode { get; set; } = CdcCheckpointMode.OnEmit;
+
+    /// <summary>
+    /// Delay before trying the lease again while another instance holds it. Defaults to 10 seconds,
+    /// which is also how long a standby instance takes to pick up a released lease.
+    /// </summary>
+    public TimeSpan LeaseRetryDelay { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Name that identifies this watcher in metrics and health check data. Defaults to
+    /// <c>default</c>; give each watcher its own name when an application runs more than one.
+    /// </summary>
+    public string Name { get; set; } = "default";
+
+    /// <summary>
+    /// How many times a handler is called for the same change before it is dead-lettered.
+    /// Defaults to 1, which is a single attempt and no retry.
+    /// </summary>
+    public int MaxHandlerAttempts { get; set; } = 1;
+
+    /// <summary>
+    /// Delay before the second handler attempt; it doubles with each further attempt, capped at
+    /// one minute. Defaults to 1 second. Only used when <see cref="MaxHandlerAttempts"/> is above 1.
+    /// </summary>
+    public TimeSpan HandlerRetryDelay { get; set; } = TimeSpan.FromSeconds(1);
 }

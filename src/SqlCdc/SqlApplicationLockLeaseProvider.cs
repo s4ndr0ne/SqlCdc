@@ -1,0 +1,260 @@
+using System.Data;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace SqlCdc;
+
+/// <summary>
+/// Elects a single active watcher with a SQL Server session-scoped application lock
+/// (<c>sp_getapplock</c>) held on a dedicated connection.
+/// </summary>
+/// <remarks>
+/// SQL Server drops the lock as soon as that connection goes away, so a crashed, killed or
+/// network-partitioned instance loses the lease on its own. There is no expiry to tune and no
+/// clock to keep in sync between instances, and two instances can never hold the lease at once:
+/// the failover window is exactly how long SQL Server takes to notice the dead session.
+/// </remarks>
+public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
+{
+    /// <summary>Lease name used when none is given. Instances sharing a name elect one leader.</summary>
+    public const string DefaultLeaseName = "SqlCdc";
+
+    /// <summary>Application lock resource names are limited to 255 characters by SQL Server.</summary>
+    private const int MaxResourceLength = 255;
+
+    private readonly string _connectionString;
+    private readonly string _resource;
+    private readonly ILogger _logger;
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private SqlConnection? _connection;
+    private bool _disposed;
+
+    /// <summary>
+    /// Creates a lease provider for the database the connection string points at. The lease is
+    /// scoped to that database, so watchers on different databases never contend.
+    /// </summary>
+    /// <param name="connectionString">Connection string to the CDC-enabled database.</param>
+    /// <param name="leaseName">Name shared by the instances that elect a leader between them.</param>
+    /// <param name="logger">Optional logger for lease transitions.</param>
+    public SqlApplicationLockLeaseProvider(
+        string connectionString,
+        string leaseName = DefaultLeaseName,
+        ILogger? logger = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        ArgumentException.ThrowIfNullOrWhiteSpace(leaseName);
+
+        _resource = $"SqlCdc:{leaseName}";
+        if (_resource.Length > MaxResourceLength)
+        {
+            throw new ArgumentException(
+                $"The lease name is too long: the resource name '{_resource}' exceeds {MaxResourceLength} characters.",
+                nameof(leaseName));
+        }
+
+        // Pooling is turned off for this one connection: a pooled connection only releases its
+        // session locks when the pool resets it on the next use, which would delay failover after
+        // a graceful stop. Unpooled, closing the connection ends the session immediately.
+        _connectionString = new SqlConnectionStringBuilder(connectionString) { Pooling = false }.ConnectionString;
+        _logger = logger ?? NullLogger<SqlApplicationLockLeaseProvider>.Instance;
+    }
+
+    /// <summary>The application lock resource this provider contends on.</summary>
+    public string ResourceName => _resource;
+
+    public async Task<bool> TryAcquireAsync(CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_connection is not null)
+            {
+                return true;
+            }
+
+            var connection = new SqlConnection(_connectionString);
+            try
+            {
+                await connection.OpenAsync(cancellationToken);
+
+                await using var cmd = new SqlCommand("sys.sp_getapplock", connection)
+                {
+                    CommandType = CommandType.StoredProcedure,
+                };
+                cmd.Parameters.AddWithValue("@Resource", _resource);
+                cmd.Parameters.AddWithValue("@LockMode", "Exclusive");
+                cmd.Parameters.AddWithValue("@LockOwner", "Session");
+                cmd.Parameters.AddWithValue("@LockTimeout", 0);
+                var returnValue = cmd.Parameters.Add("@Result", SqlDbType.Int);
+                returnValue.Direction = ParameterDirection.ReturnValue;
+
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+
+                // 0 granted, 1 granted after waiting. Anything negative means the lock was not
+                // taken, which for @LockTimeout = 0 is simply "another instance holds it".
+                var granted = returnValue.Value is int result && result >= 0;
+                if (!granted)
+                {
+                    await connection.DisposeAsync();
+                    return false;
+                }
+
+                _connection = connection;
+                _logger.LogDebug("Acquired the application lock {Resource}", _resource);
+                return true;
+            }
+            catch
+            {
+                await connection.DisposeAsync();
+                throw;
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<bool> IsHeldAsync(CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_connection is null)
+            {
+                return false;
+            }
+
+            if (_connection.State != ConnectionState.Open)
+            {
+                await DropConnectionAsync();
+                return false;
+            }
+
+            try
+            {
+                // Doubles as a keepalive: a broken connection surfaces here rather than on the
+                // next poll, and APPLOCK_MODE reports what this very session holds.
+                await using var cmd = new SqlCommand(
+                    "SELECT APPLOCK_MODE('public', @resource, 'Session');", _connection);
+                cmd.Parameters.AddWithValue("@resource", _resource);
+
+                var mode = await cmd.ExecuteScalarAsync(cancellationToken) as string;
+                if (string.Equals(mode, "Exclusive", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                _logger.LogWarning(
+                    "The application lock {Resource} is no longer held by this session (mode {Mode})",
+                    _resource, mode ?? "NoLock");
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // The lease lives on this connection: if it is unusable the lease is gone, whatever
+                // the reason. Reporting it as lost is what lets another instance take over.
+                _logger.LogWarning(ex, "The connection holding the application lock {Resource} failed", _resource);
+            }
+
+            await DropConnectionAsync();
+            return false;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task ReleaseAsync(CancellationToken cancellationToken = default)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            await ReleaseCoreAsync(cancellationToken);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        await _gate.WaitAsync();
+        try
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            await ReleaseCoreAsync(CancellationToken.None);
+        }
+        finally
+        {
+            _gate.Release();
+            _gate.Dispose();
+        }
+    }
+
+    private async Task ReleaseCoreAsync(CancellationToken cancellationToken)
+    {
+        if (_connection is null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (_connection.State == ConnectionState.Open)
+            {
+                await using var cmd = new SqlCommand("sys.sp_releaseapplock", _connection)
+                {
+                    CommandType = CommandType.StoredProcedure,
+                };
+                cmd.Parameters.AddWithValue("@Resource", _resource);
+                cmd.Parameters.AddWithValue("@LockOwner", "Session");
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Closing the connection releases the lock anyway, so a failure here is not fatal.
+            _logger.LogDebug(ex, "Releasing the application lock {Resource} failed", _resource);
+        }
+        finally
+        {
+            await DropConnectionAsync();
+        }
+    }
+
+    private async Task DropConnectionAsync()
+    {
+        var connection = _connection;
+        _connection = null;
+        if (connection is not null)
+        {
+            await connection.DisposeAsync();
+        }
+    }
+}

@@ -11,6 +11,14 @@ events (insert/update/delete with *before*/*after* images) and delivers them ove
 - Rich events: **before/after** image, operation type, LSN, commit time, and **update mask**.
 - Persistent LSN watermark: the watcher resumes exactly where it left off.
 - Bounded channel with backpressure: a slow consumer stalls the poller instead of losing events.
+- **Single active instance**: leader election over a SQL application lock, so a multi-replica
+  deployment does not emit every change N times.
+- **At-least-once end to end**: an opt-in checkpoint mode that advances the watermark only once
+  changes have actually been processed.
+- **Observable**: `Meter` and `ActivitySource` for OpenTelemetry, plus a health check that knows
+  the difference between "idle" and "stuck".
+- **Handler retry and dead-letter queue**: a failing change is retried and then parked for
+  inspection instead of vanishing into a log line.
 - Fluent API (`SqlCdcWatcherBuilder`).
 
 ## Prerequisites
@@ -78,9 +86,8 @@ public sealed class OrderChangedHandler(AppDbContext db) : ICdcChangeHandler
 
 Each handler is **scoped** and resolved in a dedicated scope per event, so injecting a
 `DbContext` is safe. All registered handlers receive every event in registration order.
-If a handler throws, the error is logged and the event is **dropped**: the watermark
-advances when the event enters the channel, not when it is handled, so retry is the
-handler's responsibility.
+A handler that throws is retried according to `WithHandlerRetry` and then dead-lettered or
+dropped — see [Handler failures](#handler-failures-retry-and-dead-letter-queue).
 
 When no handlers are registered the watcher is still started by the host. Inject
 `SqlCdcWatcher` and consume `Changes` directly.
@@ -113,6 +120,11 @@ record CdcChange
 | `UseStateStore` | in-memory | `SqlCdcStateStore` to persist the watermark LSN |
 | `WithRetryDelay` | 5 s | Delay after a polling error |
 | `WithCommandTimeout` | 30 s | Timeout for each SQL round-trip against the CDC database |
+| `WithCheckpointMode` | `OnEmit` | When the watermark is persisted (see below) |
+| `UseSingleActiveInstance` | off | Elect one active watcher across replicas |
+| `WithLeaseRetryDelay` | 10 s | How often a standby instance retries the lease |
+| `WithHandlerRetry` | 1 attempt | Attempts per handler before a change is dead-lettered |
+| `WithName` | `default` | Name of the watcher in metrics and health data |
 
 ## Delivery semantics
 
@@ -121,9 +133,78 @@ of an update stay together. For this reason `WithBatchSize` is a **soft** cap: a
 transaction larger than the batch size is read in full (with a warning logged).
 
 The channel is **bounded**: if the consumer falls behind, the poller blocks
-(`BoundedChannelFullMode.Wait`). The LSN watermark is saved after each completed batch,
-so events are delivered **at-least-once**: after a crash a batch may be re-emitted on
-restart. Consumers should deduplicate using `CdcChange.Key` if needed.
+(`BoundedChannelFullMode.Wait`). Consumers should deduplicate using `CdcChange.Key`: in both
+checkpoint modes a batch can be re-emitted after a restart.
+
+### Checkpoint mode
+
+`WithCheckpointMode` decides *when* the watermark LSN is persisted, which is what a restart
+resumes from.
+
+| Mode | Watermark advances | After a crash |
+|---|---|---|
+| `OnEmit` (default) | when the batch is written to the channel | changes still in the channel, or being handled, are **not** redelivered |
+| `OnAcknowledgement` | when every change of the batch has been acknowledged | the whole unacknowledged batch is redelivered |
+
+`OnEmit` is the cheapest and fine when losing an in-flight change is acceptable. Choose
+`OnAcknowledgement` for at-least-once delivery end to end:
+
+```csharp
+builder.Services.AddSqlCdc(cdc => cdc
+    .UseConnectionString(connectionString)
+    .WatchTable("dbo", "Orders")
+    .UseStateStore(new SqlCdcStateStore(connectionString))
+    .WithCheckpointMode(CdcCheckpointMode.OnAcknowledgement));
+```
+
+Registered `ICdcChangeHandler`s are acknowledged automatically, once every handler has been
+given the change. Consuming `watcher.Changes` directly means acknowledging by hand:
+
+```csharp
+await foreach (var change in watcher.Changes.WithCancellation(ct))
+{
+    await ProcessAsync(change);
+    change.Acknowledge();   // required: without it the watermark never advances
+}
+```
+
+Polling pauses at the batch boundary until the batch is acknowledged, so throughput follows
+the consumer. A change that is never acknowledged stalls polling for that table, and the stall
+is logged every 30 seconds rather than left silent.
+
+Note that acknowledgement covers *crashes*, not handler bugs: a handler that throws still has
+its change acknowledged and dropped (with an error logged), so one bad event cannot block the
+pipeline. Retrying is the handler's responsibility.
+
+### Running more than one instance
+
+By default the watcher assumes it is the only one: with several replicas, each would poll the
+same capture instances, deliver the same changes and overwrite the others' watermark.
+`UseSingleActiveInstance` elects one active watcher:
+
+```csharp
+builder.Services.AddSqlCdc(cdc => cdc
+    .UseConnectionString(connectionString)
+    .WatchTable("dbo", "Orders")
+    .UseStateStore(new SqlCdcStateStore(connectionString))   // must be shared between instances
+    .UseSingleActiveInstance());
+```
+
+The lease is a session-scoped SQL Server application lock (`sp_getapplock`) held on a dedicated
+connection to the watched database. SQL Server drops it as soon as that connection goes away, so
+a crashed, killed or partitioned instance loses the lease on its own: there is no expiry to tune
+and no clock to keep in sync, and two instances can never poll at the same time.
+
+Standby instances retry every `WithLeaseRetryDelay` and expose `SqlCdcWatcher.IsLeader`. On
+taking over, a standby reloads the watermarks from the state store — which therefore has to be
+a shared one (`SqlCdcStateStore`, not the in-memory default) — and continues from where the
+previous leader had checkpointed. A graceful shutdown releases the lease, so failover is
+immediate rather than waiting for SQL Server to notice a dead session.
+
+Give the lease a name to run independent watchers (different table sets) against the same
+database: `UseSingleActiveInstance("orders")`. For a different election mechanism altogether,
+implement `ICdcLeaseProvider` and pass it with `UseLeaseProvider` (or register it in DI, where
+`AddSqlCdc` picks it up automatically).
 
 ### CDC retention
 
@@ -139,6 +220,82 @@ a silent error loop. For longer outage windows, increase the retention:
 Each table has independent error state: if one capture instance fails (permissions, CDC
 disabled, table dropped), the others continue polling normally. The failing instance is
 retried after `WithRetryDelay`, not on every polling cycle.
+
+## Handler failures, retry and dead-letter queue
+
+By default a handler is called **once** per change: if it throws, the error is logged and the
+change is dropped. That is one transient timeout away from losing an event, so configure both
+a retry and somewhere for the leftovers to go:
+
+```csharp
+builder.Services.AddCdcChangeHandler<OrderChangedHandler>();
+builder.Services.AddCdcDeadLetterSink(new SqlCdcDeadLetterSink(connectionString));
+
+builder.Services.AddSqlCdc(cdc => cdc
+    .UseConnectionString(connectionString)
+    .WatchTable("dbo", "Orders")
+    .WithHandlerRetry(maxAttempts: 3, retryDelay: TimeSpan.FromSeconds(1)));
+```
+
+The delay doubles with each attempt (1 s, 2 s, 4 s …) up to one minute. When the attempts run
+out the change goes to the `ICdcDeadLetterSink`, and delivery continues: one poisonous change
+must never block everything queued behind it.
+
+`SqlCdcDeadLetterSink` writes to `dbo.cdc_dead_letter` (created automatically), keeping the
+before/after images as JSON alongside the handler name, the attempt count and the last
+exception — enough to inspect and replay. Implement `ICdcDeadLetterSink` to send them anywhere
+else. A sink that throws is logged and the change is dropped: an unavailable sink slows nothing
+down, but it does mean the dead letter itself is lost, so keep the write cheap.
+
+Retries and dead-lettering apply to handlers registered with `AddCdcChangeHandler`. Code that
+reads `watcher.Changes` directly owns its own error handling.
+
+## Observability
+
+The package publishes a `Meter` and an `ActivitySource`, both named `SqlCdc`:
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(m => m.AddMeter(SqlCdcDiagnostics.MeterName))
+    .WithTracing(t => t.AddSource(SqlCdcDiagnostics.ActivitySourceName));
+```
+
+| Metric | Kind | What it tells you |
+|---|---|---|
+| `sqlcdc.changes.emitted` | counter | Throughput, by capture instance and operation |
+| `sqlcdc.change.lag` | histogram (s) | **Freshness**: how old a change was when it was emitted |
+| `sqlcdc.poll.duration` | histogram (s) | Time spent polling one capture instance |
+| `sqlcdc.poll.failures` | counter | Failing polls — rising here with a flat emitted count is the alert |
+| `sqlcdc.batch.rows` | histogram | Rows per batch; at the batch size, the poller is the bottleneck |
+| `sqlcdc.channel.length` | gauge | Consumer backlog |
+| `sqlcdc.leader` | gauge | 1 on the active instance, 0 on a standby |
+| `sqlcdc.handler.duration` | histogram (s) | Handler time, by handler and outcome |
+| `sqlcdc.handler.failures` | counter | Handler attempts that threw, retries included |
+| `sqlcdc.dead_letters` | counter | Changes that used up their attempts |
+
+Lag is measured entirely against the SQL Server clock — `fn_cdc_map_lsn_to_time` returns the
+server's *local* time, so comparing it with the client's UTC would measure the time zone
+offset. It costs no extra round-trip.
+
+Spans: `SqlCdc.Poll` per poll of a capture instance, `SqlCdc.Handle` per handler call (tagged
+with the change key, operation and attempt number).
+
+### Health check
+
+```csharp
+builder.Services.AddHealthChecks().AddSqlCdc(tags: ["ready"]);
+```
+
+| Reported | When |
+|---|---|
+| Unhealthy | The watcher is not running, or a capture instance has failed `UnhealthyAfterConsecutiveFailures` polls in a row (3 by default) |
+| Degraded | Some recent polling failures, or — if `MaxTimeSinceLastPoll` is set — no successful poll within it |
+| Healthy | Polling normally, **or standing by** while another instance holds the lease |
+
+A standby is deliberately healthy: it is doing exactly what it should, and failing its probe
+would take a good replica out of rotation. The check reports per capture instance failure
+counts, changes emitted and time since the last successful poll in its `data`, and the same
+snapshot is available programmatically from `SqlCdcWatcher.GetStatus()`.
 
 ## Development setup
 

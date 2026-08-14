@@ -1,16 +1,16 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <!-- https://learn.microsoft.com/dotnet/fundamentals/package-validation/diagnostic-ids
 
-     Binary breaking changes against the 1.0.0 baseline, accepted on the way to the next major:
+     Binary breaking changes that 2.0.0 makes against the 1.0.0 baseline, deliberately:
 
      - SqlCdcStateStore(string, string, string): the constructor gained optional parameters
        (createTableIfMissing, commandTimeout). Optional parameters are source compatible but not
        binary compatible — an assembly compiled against 1.0.0 calls the three-argument overload.
      - SqlCdcWatcher.StopAsync(): gained a CancellationToken, same story.
 
-     Both are listed in CHANGELOG.md. Once the next major ships, raise
-     PackageValidationBaselineVersion to it and delete this file: anything still reported then is
-     a new break, not one that was already accounted for.
+     Both are listed in CHANGELOG.md. Once 2.0.0 is published, raise
+     PackageValidationBaselineVersion to 2.0.0 and delete this file: anything still reported then
+     is a new break, not one that was already accounted for.
 -->
 
 <Suppressions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">

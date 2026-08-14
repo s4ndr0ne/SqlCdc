@@ -14,7 +14,13 @@
   </PropertyGroup>
 
   <!-- Compares the built package against the last published one and fails the build on a change
-       that would break a consumer, so a breaking change is a decision rather than an accident. -->
+       that would break a consumer, so a breaking change is a decision rather than an accident.
+
+       The baseline is the newest version on nuget.org, not the version being built: pointing it at
+       an unpublished version fails the restore with NU1102. So it stays at 1.0.0 while 2.0.0 is
+       built, and moves to 2.0.0 once 2.0.0 is published — at which point
+       CompatibilitySuppressions.xml, which lists the breaks 2.0.0 made against 1.0.0, goes away
+       with it. -->
   <PropertyGroup>
     <EnablePackageValidation>true</EnablePackageValidation>
     <PackageValidationBaselineVersion>1.0.0</PackageValidationBaselineVersion>

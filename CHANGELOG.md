@@ -4,10 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] - 2026-08-14
 
-This release contains **binary breaking changes** (see below), so under SemVer it should ship as
-`2.0.0`. Releasing is a matter of tagging: the version comes from the git tag.
+A major release. Two of the breaking changes below are binary but not source breaking, so the
+upgrade is a recompile rather than an edit — with the exception of the dependency floors, which a
+consumer pinned to `Microsoft.Data.SqlClient` 6.x has to move as well.
 
 ### Breaking
 
@@ -23,6 +24,11 @@ This release contains **binary breaking changes** (see below), so under SemVer i
   Rewinding a watermark on purpose now means editing the table.
 - When a table has two capture instances and none is specified, the **oldest** is used rather
   than whichever the server returned first. Previously the choice was undefined.
+- The dependency floors moved up by a major: `Microsoft.Data.SqlClient` from 6.0.1 to 7.0.2, and
+  the `Microsoft.Extensions.*` packages from 9.0.0 to 10.0.0 because SqlClient 7 requires them.
+  `SqlConnection`, `SqlAuthenticationParameters` and `SqlAuthenticationToken` are part of the
+  public API through `ICdcConnectionFactory` and `UseAccessTokenCallback`, so a consumer pinned to
+  SqlClient 6.x cannot restore this package without upgrading too. `net8.0` is still supported.
 
 ### Added
 
@@ -72,5 +78,5 @@ This release contains **binary breaking changes** (see below), so under SemVer i
 
 First release.
 
-[Unreleased]: https://github.com/s4ndr0ne/SqlCdc/compare/v1.0.0...HEAD
+[2.0.0]: https://github.com/s4ndr0ne/SqlCdc/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/s4ndr0ne/SqlCdc/releases/tag/v1.0.0

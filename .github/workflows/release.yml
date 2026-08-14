@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           # Without the full history MinVer cannot see the tag and would version the package as a
-          # pre-release of 1.0 — a silently wrong release.
+          # pre-release of MinVerMinimumMajorMinor — a silently wrong release.
           fetch-depth: 0
 
       - name: Setup .NET

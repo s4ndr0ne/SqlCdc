@@ -672,27 +672,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     {
         await using var conn = await _connections.OpenConnectionAsync(ct);
 
-        const string sql =
-            """
-            SELECT ct.capture_instance
-            FROM cdc.change_tables ct
-            JOIN sys.tables t ON t.object_id = ct.source_object_id
-            JOIN sys.schemas s ON s.schema_id = t.schema_id
-            WHERE s.name = @schema AND t.name = @table;
-            """;
-
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.CommandTimeout = CommandTimeoutSeconds;
-        cmd.Parameters.AddWithValue("@schema", subscription.Schema);
-        cmd.Parameters.AddWithValue("@table", subscription.Table);
-        var captureInstance = subscription.CaptureInstance ?? (string?)await cmd.ExecuteScalarAsync(ct);
-
-        if (string.IsNullOrWhiteSpace(captureInstance))
-        {
-            throw new InvalidOperationException(
-                $"No CDC capture instance found for table [{subscription.Schema}].[{subscription.Table}]. " +
-                "Enable CDC first: EXEC sys.sp_cdc_enable_table ...");
-        }
+        var available = await GetCaptureInstancesAsync(conn, subscription, ct);
+        var captureInstance = SelectCaptureInstance(subscription, available);
 
         var columns = await GetCapturedColumnsAsync(conn, captureInstance, ct);
         if (columns.Count == 0)
@@ -702,6 +683,81 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         }
 
         return new TableRuntime(subscription.Schema, subscription.Table, captureInstance, columns);
+    }
+
+    /// <summary>
+    /// Lists the capture instances defined for a source table, oldest first. SQL Server allows two
+    /// per table, which is how a schema change is rolled out without stopping capture.
+    /// </summary>
+    private async Task<List<string>> GetCaptureInstancesAsync(
+        SqlConnection conn,
+        CdcTableSubscription subscription,
+        CancellationToken ct)
+    {
+        const string sql =
+            """
+            SELECT ct.capture_instance
+            FROM cdc.change_tables ct
+            JOIN sys.tables t ON t.object_id = ct.source_object_id
+            JOIN sys.schemas s ON s.schema_id = t.schema_id
+            WHERE s.name = @schema AND t.name = @table
+            ORDER BY ct.create_date, ct.capture_instance;
+            """;
+
+        var result = new List<string>();
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.CommandTimeout = CommandTimeoutSeconds;
+        cmd.Parameters.AddWithValue("@schema", subscription.Schema);
+        cmd.Parameters.AddWithValue("@table", subscription.Table);
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            result.Add(reader.GetString(0));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Picks which capture instance to read. An explicit choice is honoured but verified, and when
+    /// a table has the two instances of a schema migration the older one wins: it is the one the
+    /// watermark belongs to, so the switch stays an explicit operational step rather than
+    /// something that happens on its own at the next restart.
+    /// </summary>
+    private string SelectCaptureInstance(CdcTableSubscription subscription, IReadOnlyList<string> available)
+    {
+        var table = $"[{subscription.Schema}].[{subscription.Table}]";
+
+        if (available.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"No CDC capture instance found for table {table}. " +
+                "Enable CDC first: EXEC sys.sp_cdc_enable_table ...");
+        }
+
+        if (subscription.CaptureInstance is { } requested)
+        {
+            var match = available.FirstOrDefault(
+                ci => string.Equals(ci, requested, StringComparison.OrdinalIgnoreCase));
+
+            // Without this check a typo only surfaces later, as a "invalid object name
+            // cdc.fn_cdc_get_all_changes_..." on every poll.
+            return match ?? throw new InvalidOperationException(
+                $"Capture instance '{requested}' is not defined for table {table}. " +
+                $"Available: {string.Join(", ", available)}.");
+        }
+
+        if (available.Count > 1)
+        {
+            _logger.LogWarning(
+                "Table {Table} has {Count} capture instances ({CaptureInstances}); reading the oldest one, " +
+                "{Selected}. This is expected during a schema migration. Pass the capture instance explicitly " +
+                "to WatchTable to choose, and note that switching starts that instance from its own watermark.",
+                table, available.Count, string.Join(", ", available), available[0]);
+        }
+
+        return available[0];
     }
 
     private async Task<List<string>> GetCapturedColumnsAsync(SqlConnection conn, string captureInstance, CancellationToken ct)

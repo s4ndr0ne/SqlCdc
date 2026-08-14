@@ -16,9 +16,18 @@ public sealed class InMemoryCdcStateStore : ICdcStateStore
         return Task.FromResult<byte[]?>(lsn is null ? null : lsn.ToArray());
     }
 
+    /// <summary>
+    /// Records the watermark, only ever forwards — the same guarantee <see cref="SqlCdcStateStore"/>
+    /// enforces in SQL, so swapping stores cannot change what gets replayed.
+    /// </summary>
     public Task SaveLastLsnAsync(string captureInstance, byte[] lsn, CancellationToken cancellationToken = default)
     {
-        _watermarks[captureInstance] = lsn.ToArray();
+        var candidate = lsn.ToArray();
+        _watermarks.AddOrUpdate(
+            captureInstance,
+            candidate,
+            (_, current) => LsnHelpers.Compare(candidate, current) > 0 ? candidate : current);
+
         return Task.CompletedTask;
     }
 }

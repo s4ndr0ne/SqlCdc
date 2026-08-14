@@ -318,6 +318,49 @@ Each table has independent error state: if one capture instance fails (permissio
 disabled, table dropped), the others continue polling normally. The failing instance is
 retried after `WithRetryDelay`, not on every polling cycle.
 
+### Capture instances and schema migrations
+
+SQL Server allows **two** capture instances per table, which is how a column is added without
+stopping capture: create a second instance, let consumers catch up, drop the first.
+
+While both exist, the watcher reads the **older** one — the instance the stored watermark
+belongs to — and logs a warning naming both. Switching is an explicit operational step, not
+something that happens by itself at the next restart:
+
+```csharp
+cdc.WatchTable("dbo", "Orders", captureInstance: "dbo_Orders_v2");
+```
+
+Watermarks are per capture instance, so a switch starts `dbo_Orders_v2` from *its* watermark —
+which does not exist yet, meaning `StartFrom` decides: `FromNow` skips whatever the old instance
+had not delivered, `FromBeginning` replays from the new instance's earliest retained LSN. Let
+the old instance drain first, then switch.
+
+An explicit capture instance is verified at startup: a name that is not defined for the table
+fails `StartAsync` listing the ones that are, instead of failing on every poll with
+`Invalid object name 'cdc.fn_cdc_get_all_changes_...'`.
+
+### The watermark table
+
+`SqlCdcStateStore` writes the watermark in a single atomic statement that takes a key-range
+lock, so concurrent writers cannot both decide the row is missing and collide on the primary
+key. The write is also **monotonic**: a lower LSN is a no-op rather than a rewind, so a watcher
+that lost its lease with a save already in flight cannot drag the new leader backwards.
+`InMemoryCdcStateStore` behaves the same way, so swapping stores does not change what is
+replayed.
+
+Both the watermark table and the dead-letter table are created on first use. Where the
+application has no DDL rights at runtime, provision them with
+[`scripts/create-state-tables.sql`](scripts/create-state-tables.sql) and turn creation off:
+
+```csharp
+new SqlCdcStateStore(connectionString, createTableIfMissing: false)
+new SqlCdcDeadLetterSink(connectionString, createTableIfMissing: false)
+```
+
+A missing table is then reported as such at startup. Both also take a `commandTimeout`
+(30 seconds by default).
+
 ## Handler failures, retry and dead-letter queue
 
 By default a handler is called **once** per change: if it throws, the error is logged and the

@@ -74,6 +74,26 @@ public sealed class SqlServerFixture : IAsyncLifetime
         return captureInstance;
     }
 
+    /// <summary>
+    /// Adds a second capture instance to an already captured table, which is how a schema change
+    /// is rolled out without stopping capture. SQL Server allows at most two per table.
+    /// </summary>
+    public async Task<string> AddCaptureInstanceAsync(string tableName, string captureInstance)
+    {
+        await ExecuteWithRetryAsync(
+            $"""
+             EXEC sys.sp_cdc_enable_table
+                  @source_schema    = N'dbo',
+                  @source_name      = N'{tableName}',
+                  @capture_instance = N'{captureInstance}',
+                  @role_name        = NULL;
+             """,
+            IsSqlServerAgentStartingError);
+
+        await WaitForCaptureInstanceAsync(captureInstance);
+        return captureInstance;
+    }
+
     /// <summary>Drops a capture instance, which is how a watched table "breaks" at runtime.</summary>
     public Task DisableCdcAsync(string tableName) => ExecuteAsync(
         $"""

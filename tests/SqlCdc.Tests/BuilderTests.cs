@@ -68,6 +68,17 @@ public class BuilderTests
         Assert.Throws<ArgumentOutOfRangeException>(() => builder.WithLeaseRetryDelay(TimeSpan.FromSeconds(seconds)));
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void Build_WithInvalidLeaseKeepaliveInterval_Throws(int seconds)
+    {
+        var builder = SqlCdcWatcherBuilder.Create();
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => builder.WithLeaseKeepaliveInterval(TimeSpan.FromSeconds(seconds)));
+    }
+
     [Fact]
     public async Task Build_WithSingleActiveInstance_Succeeds_AndIsNotLeaderUntilStarted()
     {
@@ -141,6 +152,7 @@ public class BuilderTests
 
         Assert.Equal(CdcCheckpointMode.OnEmit, options.CheckpointMode);
         Assert.Equal(TimeSpan.FromSeconds(10), options.LeaseRetryDelay);
+        Assert.Equal(TimeSpan.FromSeconds(10), options.LeaseKeepaliveInterval);
         Assert.Equal(1, options.MaxHandlerAttempts);
         Assert.Equal("default", options.Name);
     }

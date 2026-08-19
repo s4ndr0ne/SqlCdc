@@ -46,7 +46,10 @@ public sealed class CdcWatcherOptions
     /// <summary>Start mode used when no watermark LSN has been persisted yet. Defaults to <see cref="CdcStartMode.FromNow"/>.</summary>
     public CdcStartMode StartMode { get; set; } = CdcStartMode.FromNow;
 
-    /// <summary>Delay before retrying after an error. Defaults to 5 seconds.</summary>
+    /// <summary>
+    /// Delay before retrying a capture instance after a polling error; it doubles with each
+    /// consecutive failure, capped at 5 minutes. Defaults to 5 seconds.
+    /// </summary>
     public TimeSpan RetryDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>Timeout for each SQL round-trip against the CDC database. Defaults to 30 seconds.</summary>
@@ -62,6 +65,13 @@ public sealed class CdcWatcherOptions
     /// which is also how long a standby instance takes to pick up a released lease.
     /// </summary>
     public TimeSpan LeaseRetryDelay { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// How often the active instance verifies it still holds the lease. Between checks it keeps
+    /// polling on the assumption the lease is held, so this bounds both the keepalive traffic and
+    /// how long a lost lease can go unnoticed. Defaults to 10 seconds.
+    /// </summary>
+    public TimeSpan LeaseKeepaliveInterval { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>
     /// Name that identifies this watcher in metrics and health check data. Defaults to

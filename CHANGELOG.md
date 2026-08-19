@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `WithLeaseKeepaliveInterval` (`LeaseKeepaliveInterval` in configuration): how often the active
+  instance verifies it still holds the lease. Defaults to 10 seconds; previously the lease was
+  checked on every polling cycle, which with a short poll interval dominated the traffic on the
+  lease connection.
+
+### Changed
+
+- Polling a capture instance now uses a single connection for the whole cycle — log bounds,
+  changes and commit-time mapping — instead of opening one per round-trip.
+- The delay after a polling error now doubles with each consecutive failure, capped at 5 minutes,
+  instead of staying fixed at `WithRetryDelay`. The configured value is the initial delay, and a
+  successful poll resets the backoff.
+
 ## [2.0.0] - 2026-08-14
 
 A major release. Two of the breaking changes below are binary but not source breaking, so the

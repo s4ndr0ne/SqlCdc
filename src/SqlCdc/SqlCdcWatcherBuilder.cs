@@ -20,6 +20,7 @@ public sealed class SqlCdcWatcherBuilder
     private TimeSpan _commandTimeout = TimeSpan.FromSeconds(30);
     private CdcCheckpointMode _checkpointMode = CdcCheckpointMode.OnEmit;
     private TimeSpan _leaseRetryDelay = TimeSpan.FromSeconds(10);
+    private TimeSpan _leaseKeepaliveInterval = TimeSpan.FromSeconds(10);
     private ICdcLeaseProvider? _leaseProvider;
     private string? _singleActiveInstanceLeaseName;
     private ICdcConnectionFactory? _connectionFactory;
@@ -185,6 +186,23 @@ public sealed class SqlCdcWatcherBuilder
     }
 
     /// <summary>
+    /// How often the active instance verifies it still holds the lease. Between checks it keeps
+    /// polling on the assumption the lease is held, so this bounds both the keepalive traffic and
+    /// how long a lost lease can go unnoticed. Defaults to 10 seconds.
+    /// </summary>
+    public SqlCdcWatcherBuilder WithLeaseKeepaliveInterval(TimeSpan leaseKeepaliveInterval)
+    {
+        if (leaseKeepaliveInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(leaseKeepaliveInterval), "Lease keepalive interval must be positive.");
+        }
+
+        _leaseKeepaliveInterval = leaseKeepaliveInterval;
+        return this;
+    }
+
+    /// <summary>
     /// Names this watcher, which is how it is told apart from others in metrics and health data.
     /// </summary>
     public SqlCdcWatcherBuilder WithName(string name)
@@ -294,6 +312,7 @@ public sealed class SqlCdcWatcherBuilder
             CommandTimeout = _commandTimeout,
             CheckpointMode = _checkpointMode,
             LeaseRetryDelay = _leaseRetryDelay,
+            LeaseKeepaliveInterval = _leaseKeepaliveInterval,
             Name = _name,
             MaxHandlerAttempts = _maxHandlerAttempts,
             HandlerRetryDelay = _handlerRetryDelay,

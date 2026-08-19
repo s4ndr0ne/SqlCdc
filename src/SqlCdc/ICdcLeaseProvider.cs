@@ -6,8 +6,9 @@ namespace SqlCdc;
 /// and overwrites the others' watermark.
 /// </summary>
 /// <remarks>
-/// The watcher polls only while it holds the lease. It calls <see cref="IsHeldAsync"/> once per
-/// polling cycle, so an implementation must make that check cheap.
+/// The watcher polls only while it holds the lease. It calls <see cref="IsHeldAsync"/> every
+/// <see cref="CdcWatcherOptions.LeaseKeepaliveInterval"/> (10 seconds by default) and keeps
+/// polling in between on the assumption the lease is still held.
 /// </remarks>
 public interface ICdcLeaseProvider : IAsyncDisposable
 {

@@ -44,6 +44,9 @@ public sealed class SqlCdcConfiguration
     /// <summary>How often a standby instance retries the lease.</summary>
     public TimeSpan? LeaseRetryDelay { get; set; }
 
+    /// <summary>How often the active instance verifies it still holds the lease.</summary>
+    public TimeSpan? LeaseKeepaliveInterval { get; set; }
+
     /// <summary>
     /// Elects a single active watcher across replicas. Also turned on by setting
     /// <see cref="LeaseName"/> alone.
@@ -127,6 +130,11 @@ public sealed class SqlCdcConfiguration
         if (LeaseRetryDelay is { } leaseRetryDelay)
         {
             builder.WithLeaseRetryDelay(leaseRetryDelay);
+        }
+
+        if (LeaseKeepaliveInterval is { } leaseKeepaliveInterval)
+        {
+            builder.WithLeaseKeepaliveInterval(leaseKeepaliveInterval);
         }
 
         if (SingleActiveInstance == true || !string.IsNullOrWhiteSpace(LeaseName))

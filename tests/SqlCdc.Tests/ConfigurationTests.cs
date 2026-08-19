@@ -26,6 +26,7 @@ public class ConfigurationTests
             ["SqlCdc:CommandTimeout"] = "00:01:00",
             ["SqlCdc:CheckpointMode"] = "OnAcknowledgement",
             ["SqlCdc:LeaseRetryDelay"] = "00:00:03",
+            ["SqlCdc:LeaseKeepaliveInterval"] = "00:00:15",
             ["SqlCdc:MaxHandlerAttempts"] = "4",
             ["SqlCdc:HandlerRetryDelay"] = "00:00:02",
         });
@@ -42,6 +43,7 @@ public class ConfigurationTests
         Assert.Equal(TimeSpan.FromMinutes(1), options.CommandTimeout);
         Assert.Equal(CdcCheckpointMode.OnAcknowledgement, options.CheckpointMode);
         Assert.Equal(TimeSpan.FromSeconds(3), options.LeaseRetryDelay);
+        Assert.Equal(TimeSpan.FromSeconds(15), options.LeaseKeepaliveInterval);
         Assert.Equal(4, options.MaxHandlerAttempts);
         Assert.Equal(TimeSpan.FromSeconds(2), options.HandlerRetryDelay);
 

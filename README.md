@@ -125,6 +125,7 @@ builder.Services.AddSqlCdc(builder.Configuration.GetSection("SqlCdc"));
     "CommandTimeout": "00:00:30",
     "LeaseName": "sales",                 // setting it turns on single-active-instance
     "LeaseRetryDelay": "00:00:10",
+    "LeaseKeepaliveInterval": "00:00:10",
     "MaxHandlerAttempts": 3,
     "HandlerRetryDelay": "00:00:01"
   }
@@ -218,11 +219,12 @@ record CdcChange
 | `WithChannelCapacity` | 100 000 | Channel capacity (backpressure) |
 | `StartFrom` | `FromNow` | `FromNow` (skip history) or `FromBeginning` |
 | `UseStateStore` | in-memory | `SqlCdcStateStore` to persist the watermark LSN |
-| `WithRetryDelay` | 5 s | Delay after a polling error |
+| `WithRetryDelay` | 5 s | Delay after a polling error; doubles per consecutive failure, capped at 5 min |
 | `WithCommandTimeout` | 30 s | Timeout for each SQL round-trip against the CDC database |
 | `WithCheckpointMode` | `OnEmit` | When the watermark is persisted (see below) |
 | `UseSingleActiveInstance` | off | Elect one active watcher across replicas |
 | `WithLeaseRetryDelay` | 10 s | How often a standby instance retries the lease |
+| `WithLeaseKeepaliveInterval` | 10 s | How often the active instance verifies it still holds the lease |
 | `WithHandlerRetry` | 1 attempt | Attempts per handler before a change is dead-lettered |
 | `WithName` | `default` | Name of the watcher in metrics and health data |
 | `UseConnectionFactory` | connection string | Opens every connection through your own factory |
@@ -297,6 +299,12 @@ connection to the watched database. SQL Server drops it as soon as that connecti
 a crashed, killed or partitioned instance loses the lease on its own: there is no expiry to tune
 and no clock to keep in sync, and two instances can never poll at the same time.
 
+The active instance verifies it still holds the lease every `WithLeaseKeepaliveInterval`
+(10 seconds by default) and keeps polling in between, so the keepalive does not add a
+round-trip to every polling cycle. A lost lease can therefore go unnoticed for up to one
+interval; during that window the monotonic watermark keeps the old and the new leader from
+rewinding each other, and delivery stays at-least-once.
+
 Standby instances retry every `WithLeaseRetryDelay` and expose `SqlCdcWatcher.IsLeader`. On
 taking over, a standby reloads the watermarks from the state store — which therefore has to be
 a shared one (`SqlCdcStateStore`, not the in-memory default) — and continues from where the
@@ -321,7 +329,10 @@ a silent error loop. For longer outage windows, increase the retention:
 
 Each table has independent error state: if one capture instance fails (permissions, CDC
 disabled, table dropped), the others continue polling normally. The failing instance is
-retried after `WithRetryDelay`, not on every polling cycle.
+retried after `WithRetryDelay`, not on every polling cycle, and the delay doubles with each
+consecutive failure up to 5 minutes — so a capture instance that stays broken for hours is
+probed (and logged) every few minutes rather than hammered on a fixed schedule. The first
+successful poll resets the backoff.
 
 ### Capture instances and schema migrations
 

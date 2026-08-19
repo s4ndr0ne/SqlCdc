@@ -77,6 +77,7 @@ namespace SqlCdc
         public System.TimeSpan CommandTimeout { get; set; }
         public string? ConnectionString { get; set; }
         public System.TimeSpan HandlerRetryDelay { get; set; }
+        public System.TimeSpan LeaseKeepaliveInterval { get; set; }
         public System.TimeSpan LeaseRetryDelay { get; set; }
         public int MaxHandlerAttempts { get; set; }
         public string Name { get; set; }
@@ -144,6 +145,7 @@ namespace SqlCdc
         public System.TimeSpan? CommandTimeout { get; set; }
         public string? ConnectionString { get; set; }
         public System.TimeSpan? HandlerRetryDelay { get; set; }
+        public System.TimeSpan? LeaseKeepaliveInterval { get; set; }
         public string? LeaseName { get; set; }
         public System.TimeSpan? LeaseRetryDelay { get; set; }
         public int? MaxHandlerAttempts { get; set; }
@@ -233,6 +235,7 @@ namespace SqlCdc
         public SqlCdc.SqlCdcWatcherBuilder WithCheckpointMode(SqlCdc.CdcCheckpointMode checkpointMode) { }
         public SqlCdc.SqlCdcWatcherBuilder WithCommandTimeout(System.TimeSpan commandTimeout) { }
         public SqlCdc.SqlCdcWatcherBuilder WithHandlerRetry(int maxAttempts, System.TimeSpan? retryDelay = default) { }
+        public SqlCdc.SqlCdcWatcherBuilder WithLeaseKeepaliveInterval(System.TimeSpan leaseKeepaliveInterval) { }
         public SqlCdc.SqlCdcWatcherBuilder WithLeaseRetryDelay(System.TimeSpan leaseRetryDelay) { }
         public SqlCdc.SqlCdcWatcherBuilder WithName(string name) { }
         public SqlCdc.SqlCdcWatcherBuilder WithPollInterval(System.TimeSpan pollInterval) { }

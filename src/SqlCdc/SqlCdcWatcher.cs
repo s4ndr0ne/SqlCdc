@@ -20,6 +20,9 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// <summary>How long to wait for a batch to be acknowledged before warning that polling is stalled.</summary>
     private static readonly TimeSpan CheckpointWarningInterval = TimeSpan.FromSeconds(30);
 
+    /// <summary>Ceiling for the exponential backoff after consecutive polling failures.</summary>
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(5);
+
     private readonly CdcWatcherOptions _options;
     private readonly ICdcStateStore _stateStore;
     private readonly ICdcConnectionFactory _connections;
@@ -33,6 +36,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     private Task? _pollTask;
     private volatile bool _isLeader;
     private bool _standbyLogged;
+    private long _lastLeaseCheckTick;
 
     internal SqlCdcWatcher(
         CdcWatcherOptions options,
@@ -73,6 +77,11 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         if (options.LeaseRetryDelay <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(options), "LeaseRetryDelay must be positive.");
+        }
+
+        if (options.LeaseKeepaliveInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "LeaseKeepaliveInterval must be positive.");
         }
 
         if (string.IsNullOrWhiteSpace(options.Name))
@@ -346,7 +355,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                         table.ConsecutiveFailures++;
                         activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
                         SqlCdcDiagnostics.PollFailures.Add(1, TableTags(table));
-                        var retryMs = _options.RetryDelay.TotalMilliseconds;
+                        var retryDelay = RetryDelayFor(table.ConsecutiveFailures);
+                        var retryMs = retryDelay.TotalMilliseconds;
                         table.NextAttemptTick = retryMs > long.MaxValue - Environment.TickCount64
                             ? long.MaxValue
                             : Environment.TickCount64 + (long)retryMs;
@@ -354,7 +364,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                             ex,
                             "CDC polling failed for capture instance {CaptureInstance} " +
                             "({ConsecutiveFailures} consecutive failures), retrying in {RetryDelay}",
-                            table.CaptureInstance, table.ConsecutiveFailures, _options.RetryDelay);
+                            table.CaptureInstance, table.ConsecutiveFailures, retryDelay);
                     }
                 }
 
@@ -389,8 +399,20 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         {
             if (_isLeader)
             {
+                // The lease is only verified every LeaseKeepaliveInterval, not on every polling
+                // cycle: with a short poll interval the keepalive would otherwise dominate the
+                // traffic on the lease connection. The trade-off is that a lost lease can go
+                // unnoticed for up to one interval, during which the monotonic watermark keeps
+                // the old and the new leader from rewinding each other.
+                var elapsedMs = Environment.TickCount64 - _lastLeaseCheckTick;
+                if (elapsedMs < _options.LeaseKeepaliveInterval.TotalMilliseconds)
+                {
+                    return true;
+                }
+
                 if (await _leaseProvider.IsHeldAsync(ct))
                 {
+                    _lastLeaseCheckTick = Environment.TickCount64;
                     return true;
                 }
 
@@ -419,6 +441,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             // advanced them, and resuming from a stale watermark would replay everything since.
             await LoadWatermarksAsync(ct);
 
+            _lastLeaseCheckTick = Environment.TickCount64;
             _isLeader = true;
             _standbyLogged = false;
             _logger.LogInformation("Acquired the CDC lease; this instance is now the active watcher.");
@@ -439,6 +462,20 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Backoff before a failing capture instance is polled again: the configured delay, doubling
+    /// with each consecutive failure up to <see cref="MaxRetryDelay"/>. A capture instance that is
+    /// broken for hours (permissions revoked, table dropped) is then retried every few minutes
+    /// instead of being hammered — and logged — every <see cref="CdcWatcherOptions.RetryDelay"/>.
+    /// </summary>
+    private TimeSpan RetryDelayFor(int consecutiveFailures)
+    {
+        var milliseconds = _options.RetryDelay.TotalMilliseconds * Math.Pow(2, consecutiveFailures - 1);
+        return milliseconds >= MaxRetryDelay.TotalMilliseconds
+            ? MaxRetryDelay
+            : TimeSpan.FromMilliseconds(milliseconds);
+    }
+
     /// <summary>Reloads every table's watermark from the state store.</summary>
     private async Task LoadWatermarksAsync(CancellationToken ct)
     {
@@ -456,7 +493,13 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
     private async Task PollTableAsync(TableRuntime table, CancellationToken ct, Activity? activity = null)
     {
-        var (maxLsn, minLsn) = await GetLogBoundsAsync(table.CaptureInstance, ct);
+        // One connection for the whole poll — bounds, changes and time mapping — instead of one
+        // per round-trip. It stays open across channel writes and acknowledgement waits, which is
+        // fine: a connection dropped during a long consumer stall surfaces as a poll failure on
+        // the next read and the poll is retried on a fresh one.
+        await using var conn = await _connections.OpenConnectionAsync(ct);
+
+        var (maxLsn, minLsn) = await GetLogBoundsAsync(conn, table.CaptureInstance, ct);
         if (maxLsn is null)
         {
             return;
@@ -508,12 +551,12 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
         while (LsnHelpers.Compare(cursor, maxLsn) <= 0)
         {
-            var batch = await ReadChangesAsync(table, cursor, maxLsn, ct);
+            var batch = await ReadChangesAsync(conn, table, cursor, maxLsn, ct);
             if (batch.Rows.Count > 0 && batch.FullyConsumedLsn is not null)
             {
                 SqlCdcDiagnostics.BatchRows.Record(batch.Rows.Count, TableTags(table));
 
-                var (timeMap, serverTime) = await MapLsnToTimeAsync(batch.Rows.Select(r => r.Lsn), ct);
+                var (timeMap, serverTime) = await MapLsnToTimeAsync(conn, batch.Rows.Select(r => r.Lsn), ct);
                 var barrier = _options.CheckpointMode == CdcCheckpointMode.OnAcknowledgement
                     ? new CheckpointBarrier()
                     : null;
@@ -607,12 +650,12 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         }
     }
 
-    private async Task<ChangeBatch> ReadChangesAsync(TableRuntime table, byte[] fromLsn, byte[] toLsn, CancellationToken ct)
+    private async Task<ChangeBatch> ReadChangesAsync(
+        SqlConnection conn, TableRuntime table, byte[] fromLsn, byte[] toLsn, CancellationToken ct)
     {
         var functionName = $"cdc.{SqlIdentifier.Quote($"fn_cdc_get_all_changes_{table.CaptureInstance}", nameof(table.CaptureInstance))}";
         var builder = new ChangeBatchBuilder(_options.BatchSize);
 
-        await using var conn = await _connections.OpenConnectionAsync(ct);
         await using var cmd = new SqlCommand($"SELECT * FROM {functionName}(@from, @to, N'all update old')", conn);
         cmd.CommandTimeout = CommandTimeoutSeconds;
         cmd.Parameters.Add("@from", SqlDbType.Binary, 10).Value = fromLsn;
@@ -788,9 +831,9 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// Reads the end of the log and the earliest LSN still retained for a capture instance.
     /// Both come from a single round-trip, so the retention check costs nothing extra.
     /// </summary>
-    private async Task<(byte[]? MaxLsn, byte[]? MinLsn)> GetLogBoundsAsync(string captureInstance, CancellationToken ct)
+    private async Task<(byte[]? MaxLsn, byte[]? MinLsn)> GetLogBoundsAsync(
+        SqlConnection conn, string captureInstance, CancellationToken ct)
     {
-        await using var conn = await _connections.OpenConnectionAsync(ct);
         await using var cmd = new SqlCommand(
             "SELECT sys.fn_cdc_get_max_lsn(), sys.fn_cdc_get_min_lsn(@ci);", conn);
         cmd.CommandTimeout = CommandTimeoutSeconds;
@@ -843,6 +886,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// can be computed without knowing the server's time zone.
     /// </summary>
     private async Task<(Dictionary<string, DateTime> TimeMap, DateTime? ServerTime)> MapLsnToTimeAsync(
+        SqlConnection conn,
         IEnumerable<byte[]> lsns,
         CancellationToken ct)
     {
@@ -858,8 +902,6 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         {
             return (result, serverTime);
         }
-
-        await using var conn = await _connections.OpenConnectionAsync(ct);
 
         // One round-trip per chunk rather than per LSN. The chunk size stays well under the
         // 1000-row limit of a table value constructor and the 2100-parameter limit.

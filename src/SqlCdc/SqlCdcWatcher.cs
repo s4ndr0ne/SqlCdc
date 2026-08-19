@@ -517,7 +517,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             if (watermark is not null)
             {
                 table.Watermark = watermark;
-                await _stateStore.SaveLastLsnAsync(table.CaptureInstance, watermark, ct);
+                await SaveLastLsnAsync(conn, table.CaptureInstance, watermark, ct);
             }
 
             cursor = start;
@@ -584,7 +584,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 }
 
                 table.Watermark = batch.FullyConsumedLsn;
-                await _stateStore.SaveLastLsnAsync(table.CaptureInstance, batch.FullyConsumedLsn, ct);
+                await SaveLastLsnAsync(conn, table.CaptureInstance, batch.FullyConsumedLsn, ct);
                 cursor = LsnHelpers.Increment(batch.FullyConsumedLsn);
             }
 
@@ -594,6 +594,11 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             }
         }
     }
+
+    private Task SaveLastLsnAsync(SqlConnection connection, string captureInstance, byte[] lsn, CancellationToken ct) =>
+        _stateStore is SqlCdcStateStore sqlStateStore
+            ? sqlStateStore.SaveLastLsnAsync(connection, captureInstance, lsn, ct)
+            : _stateStore.SaveLastLsnAsync(captureInstance, lsn, ct);
 
     /// <summary>
     /// Counts an emitted change and records how far behind the source it was. Lag is measured

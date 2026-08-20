@@ -332,7 +332,10 @@ SQL Server's cleanup job trims change tables beyond the configured retention win
 (3 days by default). If the service is down longer than that, the saved watermark points
 to rows that no longer exist: the watcher **resumes from the oldest available LSN** and
 logs a warning. Changes in between are lost — a data loss that is explicit rather than
-a silent error loop. For longer outage windows, increase the retention:
+a silent error loop. A **running** watcher keeps every table's watermark inside the retained
+range even when the table has no changes (empty polls persist the current end of the log,
+at most once every few minutes per table), so the warning only ever means an outage longer
+than the retention window. For longer outage windows, increase the retention:
 `EXEC sys.sp_cdc_change_job @job_type='cleanup', @retention=<minutes>`.
 
 ### Error isolation

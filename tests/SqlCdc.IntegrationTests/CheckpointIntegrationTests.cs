@@ -40,14 +40,21 @@ public class CheckpointIntegrationTests
         var change = await watcher.Channel.Reader.ReadAsync(cts.Token);
         Assert.Equal(1, change.After["Id"]);
 
-        // Delivered but not acknowledged: the poller is parked on the checkpoint barrier.
+        // Delivered but not acknowledged: the poller is parked on the checkpoint barrier. Empty
+        // polls before the change may have persisted a watermark, but never one at or past the
+        // unacknowledged change — that is the replay guarantee.
         await Task.Delay(TimeSpan.FromSeconds(2));
-        Assert.Null(await store.GetLastLsnAsync(captureInstance));
+        var stored = await store.GetLastLsnAsync(captureInstance);
+        Assert.True(
+            stored is null || stored.AsSpan().SequenceCompareTo(change.StartLsn) < 0,
+            "the watermark must not advance to or past an unacknowledged change");
 
         change.Acknowledge();
 
         Assert.True(
-            await Wait.UntilAsync(async () => await store.GetLastLsnAsync(captureInstance) is not null),
+            await Wait.UntilAsync(async () =>
+                await store.GetLastLsnAsync(captureInstance) is { } lsn &&
+                lsn.AsSpan().SequenceCompareTo(change.StartLsn) >= 0),
             "the watermark was never persisted after the change was acknowledged");
     }
 

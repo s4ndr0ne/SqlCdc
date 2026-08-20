@@ -82,7 +82,7 @@ public sealed class SqlCdcStateStore : ICdcStateStore
                 var result = await cmd.ExecuteScalarAsync(cancellationToken);
                 return result is byte[] lsn ? lsn : null;
             }
-            catch (SqlException ex) when (ex.Number == 208 && attempt == 0)
+            catch (SqlException ex) when (IsMissingObjectOrConflict(ex) && attempt == 0)
             {
                 InvalidateTableCache();
             }
@@ -146,7 +146,7 @@ public sealed class SqlCdcStateStore : ICdcStateStore
                 await cmd.ExecuteNonQueryAsync(cancellationToken);
                 return;
             }
-            catch (SqlException ex) when (ex.Number == 208 && attempt == 0)
+            catch (SqlException ex) when (IsMissingObjectOrConflict(ex) && attempt == 0)
             {
                 InvalidateTableCache();
             }
@@ -154,6 +154,14 @@ public sealed class SqlCdcStateStore : ICdcStateStore
     }
 
     private void InvalidateTableCache() => Volatile.Write(ref _tableEnsured, false);
+
+    /// <summary>
+    /// Errors that mean the table's existence changed between EnsureTableAsync and the statement:
+    /// 208 (object missing — a concurrent first use hasn't created it yet) and 2714 (object name
+    /// already taken — a concurrent first use created it in the meantime). Both self-heal on the
+    /// next iteration once EnsureTableAsync sees the now-present table.
+    /// </summary>
+    private static bool IsMissingObjectOrConflict(SqlException ex) => ex.Number is 208 or 2714;
 
     private async Task EnsureTableAsync(CancellationToken cancellationToken)
     {

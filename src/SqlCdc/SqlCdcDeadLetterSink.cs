@@ -112,13 +112,26 @@ public sealed class SqlCdcDeadLetterSink : ICdcDeadLetterSink
                 await cmd.ExecuteNonQueryAsync(cancellationToken);
                 return;
             }
-            catch (SqlException ex) when (ex.Number == 208 && attempt == 0)
+            catch (SqlException ex) when (IsMissingObjectOrConflict(ex) && attempt == 0)
             {
-                // The table was dropped since it was last ensured; rebuild it and write again.
-                Volatile.Write(ref _tableEnsured, false);
+                // The table appeared between EnsureTableAsync and the statement: another first use
+                // created it (2714), or it was dropped since it was last ensured (208). Forget the
+                // cache so the next attempt re-ensures rather than retrying against a stale view.
+                // Retry once only: a table that vanishes on every attempt is a real problem, not a
+                // race, and must surface instead of looping forever.
+                InvalidateTableCache();
             }
         }
     }
+
+    /// <summary>
+    /// Errors that mean the table's existence changed between EnsureTableAsync and the statement:
+    /// 208 (missing/dropped since last ensured) and 2714 (already exists, from a concurrent
+    /// first use). Both self-heal on the next iteration.
+    /// </summary>
+    private static bool IsMissingObjectOrConflict(SqlException ex) => ex.Number is 208 or 2714;
+
+    private void InvalidateTableCache() => Volatile.Write(ref _tableEnsured, false);
 
     /// <summary>
     /// Renders the change as JSON. CDC values come off the reader as whatever CLR type the column

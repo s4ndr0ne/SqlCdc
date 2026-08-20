@@ -23,6 +23,15 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// <summary>Ceiling for the exponential backoff after consecutive polling failures.</summary>
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(5);
 
+    /// <summary>
+    /// How often an idle table's watermark is persisted at the current end of the log. Without
+    /// this the watermark of a table with no changes stands still while the CDC cleanup job trims
+    /// the change table behind it, until the retention clamp reports changes as lost even though
+    /// none existed. Minutes are plenty against a retention measured in days, and keep an idle
+    /// table from costing a write on every poll.
+    /// </summary>
+    private static readonly TimeSpan IdleWatermarkPersistInterval = TimeSpan.FromMinutes(5);
+
     private readonly CdcWatcherOptions _options;
     private readonly ICdcStateStore _stateStore;
     private readonly ICdcConnectionFactory _connections;
@@ -35,6 +44,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     private CancellationTokenSource? _cts;
     private Task? _pollTask;
     private volatile bool _isLeader;
+    private volatile bool _crashed;
     private bool _standbyLogged;
     private long _lastLeaseCheckTick;
 
@@ -138,6 +148,13 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     public bool IsLeader => _isLeader;
 
     /// <summary>
+    /// True when the polling loop terminated on an unexpected error rather than on a stop. Lets
+    /// the hosted service tell a crash (restart the watcher) from a deliberate
+    /// <see cref="StopAsync"/> by the application (leave it stopped). Reset by <see cref="StartAsync"/>.
+    /// </summary>
+    internal bool HasCrashed => _crashed;
+
+    /// <summary>
     /// Resolves the capture instances for the configured tables and starts the polling loop.
     /// Safe to call repeatedly and concurrently with <see cref="StopAsync"/>.
     /// </summary>
@@ -175,6 +192,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             }
 
             _isLeader = false;
+            _crashed = false;
             _standbyLogged = false;
 
             var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -379,6 +397,9 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            // Set before the channel completes, so a consumer that observes the completion can
+            // already tell a crash from a deliberate stop through HasCrashed.
+            _crashed = true;
             _logger.LogCritical(ex, "The CDC polling loop terminated unexpectedly.");
         }
         finally
@@ -386,6 +407,12 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             // External cancellation must complete readers too; StopAsync remains responsible for
             // disposing the CTS and allowing a later StartAsync to create a fresh channel.
             _channel.Writer.TryComplete();
+
+            // Whatever ended the loop, this instance no longer polls: hand the lease back so a
+            // standby can take over now rather than when this process exits. Without a token —
+            // the loop's own token is usually already cancelled here, and the release must still
+            // run. ReleaseLeaseAsync makes the call after StopAsync a no-op.
+            await ReleaseLeaseAsync(CancellationToken.None);
         }
     }
 
@@ -614,6 +641,20 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             {
                 break;
             }
+        }
+
+        // The loop above only exits with the watermark short of maxLsn when the rest of the range
+        // was read and turned out empty, so the watermark can safely record "read up to here". An
+        // idle table would otherwise stand still until the CDC cleanup job trimmed past it and the
+        // clamp above reported changes as lost that never existed. Throttled: an idle table costs
+        // one small write every IdleWatermarkPersistInterval, not one per poll.
+        if ((table.Watermark is null || LsnHelpers.Compare(table.Watermark, maxLsn) < 0)
+            && Environment.TickCount64 >= table.NextIdleWatermarkSaveTick)
+        {
+            table.Watermark = maxLsn;
+            await SaveLastLsnAsync(conn, table.CaptureInstance, maxLsn, ct);
+            table.NextIdleWatermarkSaveTick =
+                Environment.TickCount64 + (long)IdleWatermarkPersistInterval.TotalMilliseconds;
         }
     }
 
@@ -904,7 +945,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             "Starting capture instance {CaptureInstance} from min LSN {Lsn}",
             table.CaptureInstance, Convert.ToHexString(minLsn));
 
-        // The watermark stays unset until the first batch is actually emitted, so nothing is skipped.
+        // The watermark stays unset until the first batch is emitted or the range is confirmed
+        // empty at the end of the poll, so nothing is skipped.
         return (minLsn, null);
     }
 
@@ -994,5 +1036,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
         /// <summary>The min LSN for which the retention-gap warning was last reported, so it is not repeated.</summary>
         public byte[]? LastClampedMinLsn { get; set; }
+
+        /// <summary><see cref="Environment.TickCount64"/> before which an empty poll does not persist the watermark again.</summary>
+        public long NextIdleWatermarkSaveTick { get; set; }
     }
 }

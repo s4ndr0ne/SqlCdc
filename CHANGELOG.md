@@ -31,6 +31,23 @@ All notable changes to this project are documented here. The format follows
 - A watcher that acquired the lease but could not load its watermarks — the state store being
   unavailable, for instance — kept the lock and blocked every standby. It now releases the lease
   and retries from the standby position, so another instance can take over.
+- The watermark and dead-letter tables are created idempotently on first use. Concurrent first
+  use by several replicas previously collided on `CREATE TABLE` with error 2714 ("there is already
+  an object named…"), which self-healed on retry but logged a spurious error. The 2714 race is now
+  treated as a missing-object retry, the same as the 208 it already handled.
+- A polling loop that terminated on an unexpected error kept the lease, so no standby could take
+  over until the process exited. The lease is now released whenever the loop ends, whatever the
+  reason.
+- After such a crash the hosted service ended silently and the host kept running with CDC dead.
+  It now restarts the watcher (after `WithRetryDelay`, with the usual backoff on repeated start
+  failures); a deliberate `StopAsync` by the application still leaves the watcher stopped.
+- A table with no changes for longer than the CDC retention period (3 days by default) triggered
+  the "changes … were removed by the CDC cleanup job and are lost" warning even though no change
+  ever existed: its watermark never moved, so the cleanup job eventually trimmed past it. An empty
+  poll now records "read up to here, nothing found" by advancing the watermark to the current max
+  LSN, persisted at most once every 5 minutes per table so an idle table does not cost a write per
+  poll. The warning now only fires when changes could actually have been lost — a watcher that was
+  stopped for longer than the retention period.
 
 ## [2.0.0] - 2026-08-14
 

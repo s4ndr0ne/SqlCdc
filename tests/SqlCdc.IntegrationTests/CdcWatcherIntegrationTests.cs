@@ -97,12 +97,13 @@ public class CdcWatcherIntegrationTests
             await first.StartAsync();
             await _sql.ExecuteAsync($"INSERT INTO dbo.[{table}] (Id, Name) VALUES (1, N'before restart');");
 
-            var before = await ChangeCollector.CollectAsync(first, 1);
-            Assert.Equal(1, Assert.Single(before).After["Id"]);
+            var before = Assert.Single(await ChangeCollector.CollectAsync(first, 1));
+            Assert.Equal(1, before.After["Id"]);
 
             // Events reach the channel before the watermark is written, so stopping right after
-            // reading one would cancel the write in flight and re-deliver it on restart.
-            await WaitForWatermarkAsync(stateStore, captureInstance);
+            // reading one would cancel the write in flight and re-deliver it on restart. Empty
+            // polls persist a watermark too, so wait for the one at the change, not just for any.
+            await WaitForWatermarkAsync(stateStore, captureInstance, before.StartLsn);
         }
 
         await _sql.ExecuteAsync($"INSERT INTO dbo.[{table}] (Id, Name) VALUES (2, N'after restart');");
@@ -140,6 +141,25 @@ public class CdcWatcherIntegrationTests
         Assert.All(changes, c => Assert.Equal(CdcOperationType.Insert, c.Operation));
     }
 
+    /// <summary>
+    /// A table with no changes at all must still move its watermark: standing still would let the
+    /// CDC cleanup job trim past it and make the retention clamp report changes as lost that
+    /// never existed.
+    /// </summary>
+    [Fact]
+    public async Task AnIdleTable_StillAdvancesItsWatermark()
+    {
+        const string table = "Orders_Idle";
+        var captureInstance = await _sql.CreateCdcTableAsync(table);
+        var stateStore = new SqlCdcStateStore(_sql.ConnectionString);
+
+        await using var watcher = BuildWatcher([table], stateStore: stateStore);
+        await watcher.StartAsync();
+
+        // Nothing is ever inserted; the watermark comes from the empty poll alone.
+        await WaitForWatermarkAsync(stateStore, captureInstance);
+    }
+
     [Fact]
     public async Task WatermarkOlderThanRetention_ClampsForwardAndKeepsRunning()
     {
@@ -151,8 +171,8 @@ public class CdcWatcherIntegrationTests
         {
             await first.StartAsync();
             await _sql.ExecuteAsync($"INSERT INTO dbo.[{table}] (Id, Name) VALUES (1, N'first');");
-            Assert.Single(await ChangeCollector.CollectAsync(first, 1));
-            await WaitForWatermarkAsync(stateStore, captureInstance);
+            var delivered = Assert.Single(await ChangeCollector.CollectAsync(first, 1));
+            await WaitForWatermarkAsync(stateStore, captureInstance, delivered.StartLsn);
         }
 
         var watermark = await stateStore.GetLastLsnAsync(captureInstance);
@@ -214,11 +234,14 @@ public class CdcWatcherIntegrationTests
             "the failing capture instance should be reported by name");
     }
 
-    private static async Task<byte[]> WaitForWatermarkAsync(ICdcStateStore stateStore, string captureInstance)
+    private static async Task<byte[]> WaitForWatermarkAsync(
+        ICdcStateStore stateStore, string captureInstance, byte[]? atLeast = null)
     {
         byte[]? watermark = null;
         await WaitUntilAsync(
-            async () => (watermark = await stateStore.GetLastLsnAsync(captureInstance)) is not null,
+            async () =>
+                (watermark = await stateStore.GetLastLsnAsync(captureInstance)) is not null
+                && (atLeast is null || watermark.AsSpan().SequenceCompareTo(atLeast) >= 0),
             "the watermark was never persisted");
 
         return watermark!;

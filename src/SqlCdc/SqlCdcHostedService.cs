@@ -66,15 +66,48 @@ internal sealed class SqlCdcHostedService : BackgroundService
             return;
         }
 
-        try
+        while (!stoppingToken.IsCancellationRequested)
         {
-            await foreach (var change in _watcher.Changes.WithCancellation(stoppingToken))
+            try
             {
-                await DispatchAsync(change, stoppingToken);
+                // Re-evaluated on every iteration: a restarted watcher delivers on a new channel.
+                await foreach (var change in _watcher.Changes.WithCancellation(stoppingToken))
+                {
+                    await DispatchAsync(change, stoppingToken);
+                }
             }
-        }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-        {
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            // The channel completing means the polling loop ended. A deliberate StopAsync by the
+            // application is respected; a crash is restarted, otherwise the host would keep
+            // running with CDC silently dead.
+            if (!_watcher.HasCrashed)
+            {
+                _logger.LogInformation(
+                    "The CDC watcher was stopped; the hosted service is no longer dispatching changes.");
+                return;
+            }
+
+            _logger.LogError(
+                "The CDC polling loop crashed; restarting the watcher in {RetryDelay}.",
+                _watcher.Options.RetryDelay);
+
+            try
+            {
+                await Task.Delay(_watcher.Options.RetryDelay, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            if (!await StartWatcherAsync(stoppingToken))
+            {
+                return;
+            }
         }
     }
 

@@ -120,6 +120,19 @@ public class ConfigurationTests
     }
 
     [Fact]
+    public void RegisteringTwice_KeepsASingleWatcherAndHostedService()
+    {
+        var services = new ServiceCollection();
+        services.AddSqlCdc(cdc => cdc.UseConnectionString(ConnectionString).WatchTable("dbo", "Orders"));
+        services.AddSqlCdc(cdc => cdc.UseConnectionString(ConnectionString).WatchTable("dbo", "Orders"));
+
+        Assert.Single(services, d => d.ServiceType == typeof(SqlCdcWatcher));
+        Assert.Single(services, d =>
+            d.ServiceType == typeof(Microsoft.Extensions.Hosting.IHostedService) &&
+            d.ImplementationType == typeof(SqlCdcHostedService));
+    }
+
+    [Fact]
     public void LeaseNameAlone_TurnsOnSingleActiveInstance()
     {
         var watcher = Build(new Dictionary<string, string?>

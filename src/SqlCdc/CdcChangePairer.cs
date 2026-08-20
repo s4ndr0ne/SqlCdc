@@ -1,5 +1,8 @@
 namespace SqlCdc;
 
+using System.Diagnostics;
+using Microsoft.Extensions.Logging;
+
 /// <summary>
 /// Pairs CDC log rows (operations 3+4) into single update events and maps
 /// raw rows to <see cref="CdcChange"/> events.
@@ -18,9 +21,11 @@ internal static class CdcChangePairer
         string captureInstance,
         IReadOnlyList<string> capturedColumns,
         IReadOnlyList<RawRow> rows,
-        IReadOnlyDictionary<string, DateTime> timeMap)
+        IReadOnlyDictionary<string, DateTime> timeMap,
+        ILogger? logger = null)
     {
         var pendingBefore = new Dictionary<string, RawRow>(StringComparer.OrdinalIgnoreCase);
+        var reportedOperations = new HashSet<int>();
 
         foreach (var row in rows)
         {
@@ -49,6 +54,24 @@ internal static class CdcChangePairer
                         row.Values,
                         ComputeMask(capturedColumns, row.UpdateMask),
                         commitTime);
+                    break;
+
+                default:
+                    // SQL Server only produces 1-4, so anything else means either a newer engine
+                    // behaviour (a MERGE, historically operation 5) or a corrupt row. The change
+                    // cannot be turned into a CdcChange, but the watermark still advances past it:
+                    // dropping it silently would lose data with nothing in the logs to explain it.
+                    SqlCdcDiagnostics.SkippedRows.Add(1, new TagList { { "capture_instance", captureInstance } });
+                    if (reportedOperations.Add(row.Operation))
+                    {
+                        logger?.LogWarning(
+                            "Capture instance {CaptureInstance}: a CDC row with unsupported __$operation value " +
+                            "{Operation} was skipped. The watermark still advances past it, so the change is not " +
+                            "delivered. Supported operations are delete (1), insert (2), update before (3) and " +
+                            "update after (4).",
+                            captureInstance, row.Operation);
+                    }
+
                     break;
             }
         }

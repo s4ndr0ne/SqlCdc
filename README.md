@@ -240,6 +240,12 @@ The channel is **bounded**: if the consumer falls behind, the poller blocks
 (`BoundedChannelFullMode.Wait`). Consumers should deduplicate using `CdcChange.Key`: in both
 checkpoint modes a batch can be re-emitted after a restart.
 
+The pipeline understands only the operation values SQL Server emits (`__$operation` 1-4:
+insert, delete, update before/after image). A row with any other value — a newer engine
+behaviour or a corrupt row — cannot be turned into a `CdcChange`: it is skipped, counted in the
+`sqlcdc.skipped.rows` metric and reported with a warning, while the watermark still advances
+past it. The change is not delivered, so a non-zero count is worth an alert.
+
 ### Checkpoint mode
 
 `WithCheckpointMode` decides *when* the watermark LSN is persisted, which is what a restart
@@ -310,6 +316,10 @@ taking over, a standby reloads the watermarks from the state store — which the
 a shared one (`SqlCdcStateStore`, not the in-memory default) — and continues from where the
 previous leader had checkpointed. A graceful shutdown releases the lease, so failover is
 immediate rather than waiting for SQL Server to notice a dead session.
+
+A standby that acquires the lease but then cannot read the watermarks — the shared state store's
+database is down, for instance — releases the lease again instead of holding it while delivering
+nothing. Another instance can take over, and the failed one keeps retrying from standby.
 
 Give the lease a name to run independent watchers (different table sets) against the same
 database: `UseSingleActiveInstance("orders")`. For a different election mechanism altogether,
@@ -428,6 +438,7 @@ builder.Services.AddOpenTelemetry()
 | `sqlcdc.handler.duration` | histogram (s) | Handler time, by handler and outcome |
 | `sqlcdc.handler.failures` | counter | Handler attempts that threw, retries included |
 | `sqlcdc.dead_letters` | counter | Changes that used up their attempts |
+| `sqlcdc.skipped.rows` | counter | CDC rows skipped because `__$operation` is not supported |
 
 Lag is measured entirely against the SQL Server clock — `fn_cdc_map_lsn_to_time` returns the
 server's *local* time, so comparing it with the client's UTC would measure the time zone

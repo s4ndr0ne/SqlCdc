@@ -12,6 +12,8 @@ All notable changes to this project are documented here. The format follows
   instance verifies it still holds the lease. Defaults to 10 seconds; previously the lease was
   checked on every polling cycle, which with a short poll interval dominated the traffic on the
   lease connection.
+- `sqlcdc.skipped.rows`: counts CDC rows whose `__$operation` value is not supported, which are
+  skipped rather than delivered — see Delivery semantics.
 
 ### Changed
 
@@ -20,6 +22,15 @@ All notable changes to this project are documented here. The format follows
 - The delay after a polling error now doubles with each consecutive failure, capped at 5 minutes,
   instead of staying fixed at `WithRetryDelay`. The configured value is the initial delay, and a
   successful poll resets the backoff.
+
+### Fixed
+
+- CDC rows with an unsupported `__$operation` value were dropped silently while the watermark
+  still advanced past them. They are now counted in `sqlcdc.skipped.rows` and reported with a
+  warning (one per operation value), so the loss is visible in logs and metrics.
+- A watcher that acquired the lease but could not load its watermarks — the state store being
+  unavailable, for instance — kept the lock and blocked every standby. It now releases the lease
+  and retries from the standby position, so another instance can take over.
 
 ## [2.0.0] - 2026-08-14
 

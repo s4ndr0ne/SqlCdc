@@ -437,12 +437,34 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 return false;
             }
 
-            // Read the watermarks only now: while this instance was standing by, the active one
-            // advanced them, and resuming from a stale watermark would replay everything since.
-            await LoadWatermarksAsync(ct);
+            // Mark as leader before reading the watermarks, so a failure below releases the lease
+            // through the same path StopAsync uses. Nothing polls until this method returns true.
+            _isLeader = true;
+
+            try
+            {
+                // Read the watermarks only now: while this instance was standing by, the active one
+                // advanced them, and resuming from a stale watermark would replay everything since.
+                await LoadWatermarksAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // The lease is held but the watermarks cannot be read. Standing down with the lock
+                // in hand would keep every standby blocked while the state store is down, so hand
+                // it back and let another instance take over instead of retrying under the lock.
+                _logger.LogWarning(
+                    ex,
+                    "The CDC lease was acquired but the watermarks could not be loaded; releasing the lease " +
+                    "so another instance can take over.");
+                await ReleaseLeaseAsync(ct);
+                throw;
+            }
 
             _lastLeaseCheckTick = Environment.TickCount64;
-            _isLeader = true;
             _standbyLogged = false;
             _logger.LogInformation("Acquired the CDC lease; this instance is now the active watcher.");
             return true;
@@ -563,7 +585,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 var emitted = 0;
 
                 foreach (var change in CdcChangePairer.Pair(
-                    table.Schema, table.Table, table.CaptureInstance, table.CapturedColumns, batch.Rows, timeMap))
+                    table.Schema, table.Table, table.CaptureInstance, table.CapturedColumns, batch.Rows, timeMap, _logger))
                 {
                     // Registered before the change is written: once it is on the channel a consumer
                     // can acknowledge it at any moment, and the barrier must already know about it.

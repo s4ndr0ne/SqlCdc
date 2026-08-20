@@ -1,5 +1,7 @@
 namespace SqlCdc.Tests;
 
+using Microsoft.Extensions.Logging;
+
 public class CdcChangePairerTests
 {
     private static RawRow Row(int operation, byte[]? seqVal = null, Dictionary<string, object?>? values = null, byte[]? mask = null)
@@ -236,5 +238,64 @@ public class CdcChangePairerTests
         Assert.False(change.UpdateMask["Id"]);
         Assert.False(change.UpdateMask["Name"]);
         Assert.True(change.UpdateMask["Price"]);
+    }
+
+    // --- __$operation values outside 1-4 ---------------------------------------------
+
+    [Fact]
+    public void UnknownOperation_IsSkipped_WithoutThrowing()
+    {
+        var row = Row(5, values: Values(("Id", 1)));
+
+        Assert.Empty(Pair(row));
+    }
+
+    [Fact]
+    public void UnknownOperation_DoesNotBreakBeforeAfterPairing()
+    {
+        var before = Row(3, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 9.99m)));
+        var unknown = Row(5, seqVal: before.SeqVal, values: Values(("Id", 1)));
+        var after = Row(4, seqVal: before.SeqVal, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 12.50m)),
+            mask: new byte[] { 0b0000_0100 });
+
+        var change = Assert.Single(Pair(before, unknown, after));
+
+        Assert.Equal(CdcOperationType.Update, change.Operation);
+        Assert.Equal(9.99m, change.Before["Price"]);
+        Assert.Equal(12.50m, change.After["Price"]);
+    }
+
+    [Fact]
+    public void UnknownOperation_WarnsOncePerOperationValue()
+    {
+        var logger = new RecordingLogger();
+        var first = Row(5, seqVal: new byte[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, values: Values(("Id", 1)));
+        var second = Row(5, seqVal: new byte[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 }, values: Values(("Id", 2)));
+
+        Assert.Empty(Pair(logger, first, second));
+
+        var entry = Assert.Single(logger.Entries);
+        Assert.Equal(LogLevel.Warning, entry.Level);
+    }
+
+    private static List<CdcChange> Pair(ILogger logger, params RawRow[] rows) =>
+        CdcChangePairer.Pair("dbo", "Orders", "dbo_Orders", Columns, rows, new Dictionary<string, DateTime>(), logger)
+            .ToList();
+
+    private sealed class RecordingLogger : ILogger
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = new();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Entries.Add((logLevel, formatter(state, exception)));
     }
 }

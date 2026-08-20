@@ -48,6 +48,9 @@ public static class SqlCdcDiagnostics
     /// <summary>Changes that exhausted their attempts and were dead-lettered or dropped.</summary>
     public const string DeadLettersMetric = "sqlcdc.dead_letters";
 
+    /// <summary>CDC log rows skipped because their <c>__$operation</c> value is not supported.</summary>
+    public const string SkippedRowsMetric = "sqlcdc.skipped.rows";
+
     /// <summary>Changes currently queued on the channel: the consumer's backlog.</summary>
     public const string ChannelLengthMetric = "sqlcdc.channel.length";
 
@@ -89,6 +92,9 @@ public static class SqlCdcDiagnostics
 
     internal static readonly Counter<long> DeadLetters = Meter.CreateCounter<long>(
         DeadLettersMetric, "{change}", "Changes that exhausted their attempts.");
+
+    internal static readonly Counter<long> SkippedRows = Meter.CreateCounter<long>(
+        SkippedRowsMetric, "{row}", "CDC log rows skipped because their operation is not supported.");
 
     private static readonly ObservableGauge<int> ChannelLength = Meter.CreateObservableGauge(
         ChannelLengthMetric, ObserveChannelLength, "{change}", "Changes queued on the channel.");

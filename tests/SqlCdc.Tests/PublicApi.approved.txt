@@ -183,6 +183,7 @@ namespace SqlCdc
         public const string MeterName = "SqlCdc";
         public const string PollDurationMetric = "sqlcdc.poll.duration";
         public const string PollFailuresMetric = "sqlcdc.poll.failures";
+        public const string SkippedRowsMetric = "sqlcdc.skipped.rows";
     }
     public sealed class SqlCdcHealthCheck : Microsoft.Extensions.Diagnostics.HealthChecks.IHealthCheck
     {

@@ -111,6 +111,39 @@ public class LeaseIntegrationTests
         Assert.Equal(2, Assert.Single(fromStandby).After["Id"]);
     }
 
+    /// <summary>
+    /// A leader that acquires the lease but cannot read its watermarks must not sit on the lock:
+    /// that would keep every standby blocked while the state store is down. The lease goes back so
+    /// another instance can take over instead of everyone waiting on a leader that delivers nothing.
+    /// </summary>
+    [Fact]
+    public async Task FailedWatermarkLoad_ReleasesTheLease_SoAnotherInstanceCanTakeOver()
+    {
+        const string table = "Orders_LeaseFail";
+        await _sql.CreateCdcTableAsync(table);
+
+        await using var watcher = SqlCdcWatcherBuilder
+            .Create()
+            .UseConnectionString(_sql.ConnectionString)
+            .WatchTable("dbo", table)
+            .StartFrom(CdcStartMode.FromBeginning)
+            .UseStateStore(new FailingStateStore())
+            .UseSingleActiveInstance("watermark-fail")
+            .WithPollInterval(TimeSpan.FromMilliseconds(200))
+            .WithLeaseRetryDelay(TimeSpan.FromMilliseconds(500))
+            .Build();
+
+        await watcher.StartAsync();
+
+        // The watcher keeps failing to load watermarks, so it must keep handing the lease back. A
+        // standalone contender on the same lease eventually gets it, which only happens if the
+        // watcher really released it rather than retrying with the lock in hand.
+        await using var contender = new SqlApplicationLockLeaseProvider(_sql.ConnectionString, "watermark-fail");
+        Assert.True(
+            await Wait.UntilAsync(() => contender.TryAcquireAsync(), TimeSpan.FromSeconds(10)),
+            "the watcher held the lease while failing to load watermarks, blocking any standby");
+    }
+
     private SqlCdcWatcher BuildWatcher(string table, ICdcStateStore store) => SqlCdcWatcherBuilder
         .Create()
         .UseConnectionString(_sql.ConnectionString)
@@ -121,4 +154,14 @@ public class LeaseIntegrationTests
         .WithPollInterval(TimeSpan.FromMilliseconds(200))
         .WithLeaseRetryDelay(TimeSpan.FromMilliseconds(500))
         .Build();
+
+    /// <summary>State store whose watermark reads always fail, as when the store's database is down.</summary>
+    private sealed class FailingStateStore : ICdcStateStore
+    {
+        public Task<byte[]?> GetLastLsnAsync(string captureInstance, CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("the watermark database is unavailable");
+
+        public Task SaveLastLsnAsync(string captureInstance, byte[] lsn, CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+    }
 }

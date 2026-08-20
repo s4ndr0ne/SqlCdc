@@ -66,6 +66,10 @@ await foreach (var change in watcher.Changes.WithCancellation(cts.Token))
 }
 ```
 
+Each run delivers on a fresh channel: `Changes` completes on `StopAsync`, and a watcher that is
+started again must be enumerated again — a cached enumerable (or `Channel` reference) from before
+the restart no longer receives anything.
+
 ### ASP.NET Core / Generic Host
 
 ```csharp
@@ -309,7 +313,9 @@ The active instance verifies it still holds the lease every `WithLeaseKeepaliveI
 (10 seconds by default) and keeps polling in between, so the keepalive does not add a
 round-trip to every polling cycle. A lost lease can therefore go unnoticed for up to one
 interval; during that window the monotonic watermark keeps the old and the new leader from
-rewinding each other, and delivery stays at-least-once.
+rewinding each other, and delivery stays at-least-once. The corollary of at-least-once is that
+the same change can be delivered more than once — during a takeover, or when a batch is replayed
+after a crash — so handlers and direct consumers must be idempotent.
 
 Standby instances retry every `WithLeaseRetryDelay` and expose `SqlCdcWatcher.IsLeader`. On
 taking over, a standby reloads the watermarks from the state store — which therefore has to be

@@ -139,7 +139,11 @@ public sealed class SqlCdcStateStore : ICdcStateStore
                      END
 
                      COMMIT TRANSACTION;
+                     SET XACT_ABORT OFF;
                      """;
+                // XACT_ABORT is session state and this may be the polling loop's shared connection,
+                // so the batch restores it. An error aborts the batch before the restore, but it
+                // also fails the poll and the connection is disposed with it.
                  await using var cmd = new SqlCommand(sql, connection) { CommandTimeout = _commandTimeoutSeconds };
                 cmd.Parameters.AddWithValue("@ci", captureInstance);
                 cmd.Parameters.Add("@lsn", System.Data.SqlDbType.Binary, 10).Value = lsn;
@@ -216,7 +220,16 @@ public sealed class SqlCdcStateStore : ICdcStateStore
                  """;
             await using var cmd = new SqlCommand(sql, connection) { CommandTimeout = _commandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@tableName", TableName);
-            await cmd.ExecuteNonQueryAsync(cancellationToken);
+            try
+            {
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+            catch (SqlException ex) when (ex.Number == 2714)
+            {
+                // Another process created the table between the existence check and the CREATE.
+                // The table exists, which is all this method has to ensure.
+            }
+
             _tableEnsured = true;
         }
         finally

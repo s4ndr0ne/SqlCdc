@@ -76,6 +76,14 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
             ? sqlFactory.WithConnectionString(b => b.Pooling = false)
             : connections;
         _logger = logger ?? NullLogger<SqlApplicationLockLeaseProvider>.Instance;
+
+        if (connections is not SqlCdcConnectionFactory)
+        {
+            _logger.LogInformation(
+                "The CDC lease will be held on a connection from a custom factory. Make sure that connection is " +
+                "opened with pooling disabled: a pooled connection released back to the pool can keep holding the " +
+                "session lock until it is reused, which delays failover.");
+        }
     }
 
     /// <summary>The application lock resource this provider contends on.</summary>
@@ -255,8 +263,19 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
         }
         catch (Exception ex)
         {
-            // Closing the connection releases the lock anyway, so a failure here is not fatal.
+            // Closing an unpooled connection releases the lock anyway. A pooled one — a custom
+            // factory may hand those out — would go back to the pool still holding the session
+            // lock; clearing its pool makes the dispose below end the session for real, so the
+            // lock dies with it instead of lingering until the pool reuses the connection.
             _logger.LogDebug(ex, "Releasing the application lock {Resource} failed", _resource);
+            try
+            {
+                SqlConnection.ClearPool(_connection);
+            }
+            catch
+            {
+                // Best effort: the connection may be in a state ClearPool rejects.
+            }
         }
         finally
         {

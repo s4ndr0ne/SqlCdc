@@ -48,6 +48,31 @@ All notable changes to this project are documented here. The format follows
   LSN, persisted at most once every 5 minutes per table so an idle table does not cost a write per
   poll. The warning now only fires when changes could actually have been lost — a watcher that was
   stopped for longer than the retention period.
+- A dead consumer with a full channel parked the poller inside the channel write with nothing in
+  the logs — the acknowledgement warning never fired because the batch was still being published.
+  A blocked write is now reported every 30 seconds with the queue length.
+- `sys.fn_cdc_get_max_lsn()` returning NULL (the CDC capture job never processed a transaction)
+  was silently indistinguishable from an idle database: the poll "succeeded" and the watcher
+  looked healthy while nothing could ever be delivered. It is now reported with a warning, once
+  per occurrence.
+- Setting `SingleActiveInstance`/`LeaseName` in the configuration section silently discarded an
+  `ICdcLeaseProvider` registered in the container. The contradiction now fails at startup with
+  both sides named.
+- If `sp_releaseapplock` fails on a pooled lease connection (custom connection factories may hand
+  those out), the connection went back to the pool still holding the session lock, delaying
+  failover until the pool reused it. The pool is now cleared so disposing truly ends the session,
+  and a custom factory is reminded at construction that the lease connection should be unpooled.
+- The static metrics registry pinned undisposed watchers forever (and kept reporting their
+  gauges). It now holds them weakly: a collected watcher drops out of the metrics on its own.
+- An update before-image (`__$operation` = 3) without its after-image was dropped silently; it is
+  now counted in `sqlcdc.skipped.rows` and reported with a warning, like unknown operations.
+- Concurrent first use across processes could fail transiently on `CREATE TABLE` (error 2714)
+  inside the ensure step itself; it is now treated as "the table exists", which is all the ensure
+  has to guarantee.
+- `SaveLastLsnAsync` left `SET XACT_ABORT ON` on the shared polling connection for the rest of
+  the poll; the batch now restores it.
+- `GetStatus()` read the per-table timestamps without synchronization, allowing torn reads from
+  health probes; they are now stored as atomically-read ticks.
 
 ## [2.0.0] - 2026-08-14
 

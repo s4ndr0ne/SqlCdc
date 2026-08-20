@@ -226,7 +226,16 @@ public sealed class SqlCdcDeadLetterSink : ICdcDeadLetterSink
 
             await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = _commandTimeoutSeconds };
             cmd.Parameters.AddWithValue("@tableName", TableName);
-            await cmd.ExecuteNonQueryAsync(cancellationToken);
+            try
+            {
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+            catch (SqlException ex) when (ex.Number == 2714)
+            {
+                // Another process created the table between the existence check and the CREATE.
+                // The table exists, which is all this method has to ensure.
+            }
+
             _tableEnsured = true;
         }
         finally

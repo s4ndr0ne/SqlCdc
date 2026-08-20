@@ -266,6 +266,21 @@ public class CdcChangePairerTests
     }
 
     [Fact]
+    public void OrphanBeforeImage_IsSkipped_WithAWarning()
+    {
+        var logger = new RecordingLogger();
+        var before = Row(3, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 9.99m)));
+
+        // A before-image with no after-image never comes out of SQL Server, but if it did, it must
+        // be reported like any other skipped row rather than vanish without a trace.
+        Assert.Empty(Pair(logger, before));
+
+        var entry = Assert.Single(logger.Entries);
+        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Contains("before-image", entry.Message);
+    }
+
+    [Fact]
     public void UnknownOperation_WarnsOncePerOperationValue()
     {
         var logger = new RecordingLogger();

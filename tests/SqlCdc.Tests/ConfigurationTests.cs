@@ -120,6 +120,40 @@ public class ConfigurationTests
     }
 
     [Fact]
+    public void SingleActiveInstanceInConfig_ConflictsWithALeaseProviderFromTheContainer()
+    {
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["SqlCdc:ConnectionString"] = ConnectionString,
+            ["SqlCdc:Tables:0:Table"] = "Orders",
+            ["SqlCdc:SingleActiveInstance"] = "true",
+        }).Build();
+
+        var services = new ServiceCollection();
+        services.AddSingleton<ICdcLeaseProvider, StubLeaseProvider>();
+        services.AddSqlCdc(configuration.GetSection("SqlCdc"));
+
+        // Silently discarding the registered provider would run with the wrong election mechanism,
+        // so the contradiction fails at build time with both sides named.
+        var error = Assert.Throws<InvalidOperationException>(
+            () => services.BuildServiceProvider().GetRequiredService<SqlCdcWatcher>());
+
+        Assert.Contains("SingleActiveInstance", error.Message);
+        Assert.Contains(nameof(StubLeaseProvider), error.Message);
+    }
+
+    private sealed class StubLeaseProvider : ICdcLeaseProvider
+    {
+        public Task<bool> TryAcquireAsync(CancellationToken cancellationToken = default) => Task.FromResult(true);
+
+        public Task<bool> IsHeldAsync(CancellationToken cancellationToken = default) => Task.FromResult(true);
+
+        public Task ReleaseAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    [Fact]
     public void RegisteringTwice_KeepsASingleWatcherAndHostedService()
     {
         var services = new ServiceCollection();

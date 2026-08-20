@@ -75,6 +75,20 @@ internal static class CdcChangePairer
                     break;
             }
         }
+
+        // A before-image (operation 3) is always followed by its after-image (operation 4) within
+        // the same transaction, and batches are cut on transaction boundaries — so leftovers here
+        // mean the source produced something unexpected. Like unknown operations, they are counted
+        // and reported rather than dropped silently: the watermark still advances past them.
+        if (pendingBefore.Count > 0)
+        {
+            SqlCdcDiagnostics.SkippedRows.Add(
+                pendingBefore.Count, new TagList { { "capture_instance", captureInstance } });
+            logger?.LogWarning(
+                "Capture instance {CaptureInstance}: {Count} update before-image row(s) (__$operation = 3) had " +
+                "no matching after-image and were skipped. The watermark still advances past them.",
+                captureInstance, pendingBefore.Count);
+        }
     }
 
     private static CdcChange Create(

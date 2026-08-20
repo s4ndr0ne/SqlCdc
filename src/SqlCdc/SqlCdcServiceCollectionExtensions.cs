@@ -98,7 +98,26 @@ public static class SqlCdcServiceCollectionExtensions
 
             // Configuration first, then the delegate: code wins over the section, and both win
             // over what was resolved from the container.
-            configuration?.Get<SqlCdcConfiguration>()?.ApplyTo(builder);
+            var boundConfiguration = configuration?.Get<SqlCdcConfiguration>();
+            if (boundConfiguration is not null)
+            {
+                // The section turning on the built-in election would silently discard the custom
+                // provider registered above. That contradiction is a configuration mistake, and it
+                // fails startup with both sides named rather than running with the wrong one.
+                if (leaseProvider is not null &&
+                    (boundConfiguration.SingleActiveInstance == true ||
+                     !string.IsNullOrWhiteSpace(boundConfiguration.LeaseName)))
+                {
+                    throw new InvalidOperationException(
+                        $"The SqlCdc configuration section sets SingleActiveInstance/LeaseName, but an " +
+                        $"{nameof(ICdcLeaseProvider)} ({leaseProvider.GetType().Name}) is also registered in the " +
+                        "container. Use one or the other: remove the registration, or drop the setting from the " +
+                        "section.");
+                }
+
+                boundConfiguration.ApplyTo(builder);
+            }
+
             configure?.Invoke(builder);
             return builder.Build();
         });

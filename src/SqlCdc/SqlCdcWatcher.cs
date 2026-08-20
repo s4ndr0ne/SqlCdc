@@ -17,7 +17,10 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// <summary>Number of LSNs mapped to commit times in a single round-trip.</summary>
     private const int LsnTimeMapChunkSize = 500;
 
-    /// <summary>How long to wait for a batch to be acknowledged before warning that polling is stalled.</summary>
+    /// <summary>
+    /// How long a blocked wait — on outstanding acknowledgements or on a full channel — goes
+    /// before it is reported as a stalled poll, and re-reported while it lasts.
+    /// </summary>
     private static readonly TimeSpan CheckpointWarningInterval = TimeSpan.FromSeconds(30);
 
     /// <summary>Ceiling for the exponential backoff after consecutive polling failures.</summary>
@@ -132,10 +135,18 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     private int CommandTimeoutSeconds =>
         (int)Math.Clamp(Math.Ceiling(_options.CommandTimeout.TotalSeconds), 1, int.MaxValue);
 
-    /// <summary>The bounded channel events are delivered onto.</summary>
+    /// <summary>
+    /// The bounded channel events are delivered onto. Each run has its own channel: a watcher
+    /// that is started again after a stop delivers on a fresh instance, so read this property
+    /// again after a restart rather than holding on to a previous one.
+    /// </summary>
     public Channel<CdcChange> Channel => _channel;
 
-    /// <summary>Asynchronous sequence of change events. Completion is signaled on <see cref="StopAsync"/>.</summary>
+    /// <summary>
+    /// Asynchronous sequence of change events. Completion is signaled on <see cref="StopAsync"/>.
+    /// A watcher that is started again delivers on a fresh channel: enumerate this property again
+    /// after a restart, or events go onto a channel the old enumeration no longer reads.
+    /// </summary>
     public IAsyncEnumerable<CdcChange> Changes => _channel.Reader.ReadAllAsync();
 
     /// <summary>True while the polling loop is running.</summary>
@@ -272,14 +283,21 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     public CdcWatcherStatus GetStatus()
     {
         var tables = _tables.Values
-            .Select(t => new CdcTableStatus(
-                t.CaptureInstance,
-                t.Schema,
-                t.Table,
-                t.ConsecutiveFailures,
-                t.LastSuccessfulPoll,
-                t.LastEmittedCommitTime,
-                Interlocked.Read(ref t.ChangesEmitted)))
+            .Select(t =>
+            {
+                // Times are stored as ticks so this cross-thread read cannot tear: DateTimeOffset
+                // is wider than a word, a long read through Volatile is atomic.
+                var pollTicks = Volatile.Read(ref t.LastSuccessfulPollTicks);
+                var commitTicks = Volatile.Read(ref t.LastEmittedCommitTimeTicks);
+                return new CdcTableStatus(
+                    t.CaptureInstance,
+                    t.Schema,
+                    t.Table,
+                    Volatile.Read(ref t.ConsecutiveFailures),
+                    pollTicks == 0 ? null : new DateTimeOffset(pollTicks, TimeSpan.Zero),
+                    commitTicks == 0 ? null : new DateTime(commitTicks),
+                    Interlocked.Read(ref t.ChangesEmitted));
+            })
             .OrderBy(t => t.CaptureInstance, StringComparer.Ordinal)
             .ToList();
 
@@ -358,9 +376,9 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     try
                     {
                         await PollTableAsync(table, ct, activity);
-                        table.ConsecutiveFailures = 0;
+                        Volatile.Write(ref table.ConsecutiveFailures, 0);
                         table.NextAttemptTick = 0;
-                        table.LastSuccessfulPoll = DateTimeOffset.UtcNow;
+                        Volatile.Write(ref table.LastSuccessfulPollTicks, DateTimeOffset.UtcNow.UtcTicks);
                         SqlCdcDiagnostics.PollDuration.Record(
                             Stopwatch.GetElapsedTime(startedAt).TotalSeconds, TableTags(table));
                     }
@@ -370,7 +388,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     }
                     catch (Exception ex)
                     {
-                        table.ConsecutiveFailures++;
+                        Volatile.Write(ref table.ConsecutiveFailures, table.ConsecutiveFailures + 1);
                         activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
                         SqlCdcDiagnostics.PollFailures.Add(1, TableTags(table));
                         var retryDelay = RetryDelayFor(table.ConsecutiveFailures);
@@ -551,8 +569,23 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         var (maxLsn, minLsn) = await GetLogBoundsAsync(conn, table.CaptureInstance, ct);
         if (maxLsn is null)
         {
+            // NULL until the capture job has processed its first transaction. Left silent, a
+            // capture job that never ran is indistinguishable from an idle database: the poll
+            // "succeeds" and the watcher looks healthy while nothing can ever be delivered.
+            if (!table.NullMaxLsnReported)
+            {
+                table.NullMaxLsnReported = true;
+                _logger.LogWarning(
+                    "Capture instance {CaptureInstance}: sys.fn_cdc_get_max_lsn() returned NULL, so there is " +
+                    "nothing to read yet. If this persists, the CDC capture job is likely not running — check " +
+                    "sys.sp_cdc_help_jobs and the SQL Server Agent.",
+                    table.CaptureInstance);
+            }
+
             return;
         }
+
+        table.NullMaxLsnReported = false;
 
         byte[] cursor;
         if (table.Watermark is null)
@@ -617,7 +650,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     // Registered before the change is written: once it is on the channel a consumer
                     // can acknowledge it at any moment, and the barrier must already know about it.
                     var published = barrier is null ? change : change with { Acknowledgement = barrier.Register() };
-                    await _channel.Writer.WriteAsync(published, ct);
+                    await WriteToChannelAsync(table, published, ct);
 
                     emitted++;
                     RecordEmitted(table, published, serverTime);
@@ -679,7 +712,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             return;
         }
 
-        table.LastEmittedCommitTime = change.CommitTime;
+        Volatile.Write(ref table.LastEmittedCommitTimeTicks, change.CommitTime.Ticks);
 
         if (serverTime is not null)
         {
@@ -687,6 +720,39 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             if (lag > TimeSpan.Zero)
             {
                 SqlCdcDiagnostics.ChangeLag.Record(lag.TotalSeconds, TableTags(table));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Writes one change to the channel, reporting periodically while the channel is full. A dead
+    /// consumer otherwise parks the poller inside the write with nothing in the logs — the
+    /// acknowledgement warning never fires because the batch is still being published.
+    /// </summary>
+    private async Task WriteToChannelAsync(TableRuntime table, CdcChange change, CancellationToken ct)
+    {
+        var write = _channel.Writer.WriteAsync(change, ct);
+        if (write.IsCompletedSuccessfully)
+        {
+            return;
+        }
+
+        var pending = write.AsTask();
+        var waited = TimeSpan.Zero;
+        while (true)
+        {
+            try
+            {
+                await pending.WaitAsync(CheckpointWarningInterval, ct);
+                return;
+            }
+            catch (TimeoutException)
+            {
+                waited += CheckpointWarningInterval;
+                _logger.LogWarning(
+                    "Capture instance {CaptureInstance}: the channel has been full for {Waited} and polling is " +
+                    "blocked. Is the consumer still reading? {QueuedChanges} change(s) are waiting to be consumed.",
+                    table.CaptureInstance, waited, _channel.Reader.Count);
             }
         }
     }
@@ -1022,14 +1088,17 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         public IReadOnlyList<string> CapturedColumns { get; }
         public byte[]? Watermark { get; set; }
 
-        /// <summary>When this capture instance was last polled without error.</summary>
-        public DateTimeOffset? LastSuccessfulPoll { get; set; }
+        /// <summary>
+        /// UTC ticks of the last poll without error (0 = never). Kept as a long with Volatile
+        /// access because GetStatus reads it from another thread and a DateTimeOffset could tear.
+        /// </summary>
+        public long LastSuccessfulPollTicks;
 
-        /// <summary>Commit time of the last change emitted, in SQL Server local time.</summary>
-        public DateTime? LastEmittedCommitTime { get; set; }
+        /// <summary>Ticks of the last emitted commit time, SQL Server local (0 = never); Volatile access.</summary>
+        public long LastEmittedCommitTimeTicks;
 
-        /// <summary>Failed polls in a row for this table; reset on the first success.</summary>
-        public int ConsecutiveFailures { get; set; }
+        /// <summary>Failed polls in a row for this table; reset on the first success. Read by GetStatus.</summary>
+        public int ConsecutiveFailures;
 
         /// <summary><see cref="Environment.TickCount64"/> before which this table is not polled again.</summary>
         public long NextAttemptTick { get; set; }
@@ -1039,5 +1108,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
         /// <summary><see cref="Environment.TickCount64"/> before which an empty poll does not persist the watermark again.</summary>
         public long NextIdleWatermarkSaveTick { get; set; }
+
+        /// <summary>Whether the NULL-max-LSN warning was already logged, so it fires once per occurrence.</summary>
+        public bool NullMaxLsnReported { get; set; }
     }
 }

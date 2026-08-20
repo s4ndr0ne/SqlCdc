@@ -1,6 +1,6 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Runtime.CompilerServices;
 
 namespace SqlCdc;
 
@@ -64,8 +64,10 @@ public static class SqlCdcDiagnostics
     /// <summary>
     /// Live watchers, so the observable gauges can be created once on a static meter instead of
     /// one instrument per watcher. Watchers add themselves when built and drop out when disposed.
+    /// Held weakly: a watcher that is never disposed must not be pinned forever by this static
+    /// registry — once collected it simply drops out of the gauges.
     /// </summary>
-    private static readonly ConcurrentDictionary<SqlCdcWatcher, byte> Watchers = new();
+    private static readonly ConditionalWeakTable<SqlCdcWatcher, object?> Watchers = new();
 
     internal static readonly ActivitySource ActivitySource = new(ActivitySourceName, Version);
 
@@ -102,15 +104,15 @@ public static class SqlCdcDiagnostics
     private static readonly ObservableGauge<int> Leader = Meter.CreateObservableGauge(
         LeaderMetric, ObserveLeader, description: "1 when this instance holds the lease, 0 when it stands by.");
 
-    internal static void Register(SqlCdcWatcher watcher) => Watchers[watcher] = 0;
+    internal static void Register(SqlCdcWatcher watcher) => Watchers.AddOrUpdate(watcher, null);
 
-    internal static void Unregister(SqlCdcWatcher watcher) => Watchers.TryRemove(watcher, out _);
+    internal static void Unregister(SqlCdcWatcher watcher) => Watchers.Remove(watcher);
 
     private static IEnumerable<Measurement<int>> ObserveChannelLength() =>
-        Watchers.Keys.Select(w => new Measurement<int>(w.Channel.Reader.Count, WatcherTag(w)));
+        Watchers.Select(entry => new Measurement<int>(entry.Key.Channel.Reader.Count, WatcherTag(entry.Key)));
 
     private static IEnumerable<Measurement<int>> ObserveLeader() =>
-        Watchers.Keys.Select(w => new Measurement<int>(w.IsLeader ? 1 : 0, WatcherTag(w)));
+        Watchers.Select(entry => new Measurement<int>(entry.Key.IsLeader ? 1 : 0, WatcherTag(entry.Key)));
 
     private static KeyValuePair<string, object?> WatcherTag(SqlCdcWatcher watcher) =>
         new("watcher", watcher.Name);

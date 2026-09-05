@@ -25,7 +25,6 @@ internal static class CdcChangePairer
         ILogger? logger = null)
     {
         var pendingBefore = new Dictionary<string, RawRow>(StringComparer.OrdinalIgnoreCase);
-        var reportedOperations = new HashSet<int>();
 
         foreach (var row in rows)
         {
@@ -47,7 +46,11 @@ internal static class CdcChangePairer
                     break;
 
                 case 4: // update after-image
-                    pendingBefore.Remove(key, out var before);
+                    if (!pendingBefore.Remove(key, out var before))
+                    {
+                        throw new InvalidOperationException(
+                            $"Capture instance '{captureInstance}' produced an update after-image without a matching before-image.");
+                    }
                     yield return Create(
                         schema, table, captureInstance, row, CdcOperationType.Update,
                         before?.Values ?? EmptyValues,
@@ -57,37 +60,17 @@ internal static class CdcChangePairer
                     break;
 
                 default:
-                    // SQL Server only produces 1-4, so anything else means either a newer engine
-                    // behaviour (a MERGE, historically operation 5) or a corrupt row. The change
-                    // cannot be turned into a CdcChange, but the watermark still advances past it:
-                    // dropping it silently would lose data with nothing in the logs to explain it.
-                    SqlCdcDiagnostics.SkippedRows.Add(1, new TagList { { "capture_instance", captureInstance } });
-                    if (reportedOperations.Add(row.Operation))
-                    {
-                        logger?.LogWarning(
-                            "Capture instance {CaptureInstance}: a CDC row with unsupported __$operation value " +
-                            "{Operation} was skipped. The watermark still advances past it, so the change is not " +
-                            "delivered. Supported operations are delete (1), insert (2), update before (3) and " +
-                            "update after (4).",
-                            captureInstance, row.Operation);
-                    }
-
-                    break;
+                    throw new InvalidOperationException(
+                        $"Capture instance '{captureInstance}' produced unsupported __$operation value {row.Operation}. " +
+                        "The checkpoint was not advanced, so no change is silently lost.");
             }
         }
 
-        // A before-image (operation 3) is always followed by its after-image (operation 4) within
-        // the same transaction, and batches are cut on transaction boundaries — so leftovers here
-        // mean the source produced something unexpected. Like unknown operations, they are counted
-        // and reported rather than dropped silently: the watermark still advances past them.
         if (pendingBefore.Count > 0)
         {
-            SqlCdcDiagnostics.SkippedRows.Add(
-                pendingBefore.Count, new TagList { { "capture_instance", captureInstance } });
-            logger?.LogWarning(
-                "Capture instance {CaptureInstance}: {Count} update before-image row(s) (__$operation = 3) had " +
-                "no matching after-image and were skipped. The watermark still advances past them.",
-                captureInstance, pendingBefore.Count);
+            throw new InvalidOperationException(
+                $"Capture instance '{captureInstance}' produced {pendingBefore.Count} update before-image row(s) " +
+                "without a matching after-image. The checkpoint was not advanced, so no change is silently lost.");
         }
     }
 

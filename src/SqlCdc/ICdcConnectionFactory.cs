@@ -65,6 +65,15 @@ public sealed class SqlCdcConnectionFactory : ICdcConnectionFactory
     }
 
     /// <summary>
+    /// Whether the other factory opens connections to the same place, with the same
+    /// authentication. A conservative check: two strings that differ only in spelling compare
+    /// unequal, which costs a separate connection rather than a wrong one.
+    /// </summary>
+    internal bool OpensSameConnectionsAs(SqlCdcConnectionFactory other) =>
+        string.Equals(_connectionString, other._connectionString, StringComparison.Ordinal)
+        && ReferenceEquals(_accessTokenCallback, other._accessTokenCallback);
+
+    /// <summary>
     /// Copies this factory onto a modified connection string, keeping the token callback. Used by
     /// the lease provider, which needs its own unpooled connection.
     /// </summary>

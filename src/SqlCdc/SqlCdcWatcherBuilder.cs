@@ -18,11 +18,13 @@ public sealed class SqlCdcWatcherBuilder
     private CdcStartMode _startMode = CdcStartMode.FromNow;
     private TimeSpan _retryDelay = TimeSpan.FromSeconds(5);
     private TimeSpan _commandTimeout = TimeSpan.FromSeconds(30);
-    private CdcCheckpointMode _checkpointMode = CdcCheckpointMode.OnEmit;
+    private CdcCheckpointMode _checkpointMode = CdcCheckpointMode.OnAcknowledgement;
     private TimeSpan _leaseRetryDelay = TimeSpan.FromSeconds(10);
     private TimeSpan _leaseKeepaliveInterval = TimeSpan.FromSeconds(10);
     private ICdcLeaseProvider? _leaseProvider;
-    private string? _singleActiveInstanceLeaseName;
+    // Replicas must never deliver the same CDC stream concurrently. Call
+    // UseSingleActiveInstance with a distinct name for an independent watcher.
+    private string? _singleActiveInstanceLeaseName = SqlApplicationLockLeaseProvider.DefaultLeaseName;
     private ICdcConnectionFactory? _connectionFactory;
     private Func<SqlAuthenticationParameters, CancellationToken, Task<SqlAuthenticationToken>>? _accessTokenCallback;
     private string _name = "default";
@@ -132,7 +134,7 @@ public sealed class SqlCdcWatcherBuilder
 
     /// <summary>
     /// Chooses when the watermark LSN is persisted. Use
-    /// <see cref="CdcCheckpointMode.OnAcknowledgement"/> for at-least-once delivery end to end.
+    /// <see cref="CdcCheckpointMode.OnAcknowledgement"/> is the default for at-least-once delivery end to end.
     /// </summary>
     public SqlCdcWatcherBuilder WithCheckpointMode(CdcCheckpointMode checkpointMode)
     {
@@ -142,8 +144,8 @@ public sealed class SqlCdcWatcherBuilder
 
     /// <summary>
     /// Makes only one instance poll at a time, electing a leader through a SQL Server application
-    /// lock on the watched database. Required whenever the application runs with more than one
-    /// replica: without it every replica emits the same changes and fights over the watermark.
+    /// lock on the watched database. This is enabled by default; use a distinct name for an
+    /// independent watcher against the same database.
     /// </summary>
     /// <param name="leaseName">
     /// Name shared by the instances that elect a leader between them. Use distinct names to run
@@ -332,7 +334,11 @@ public sealed class SqlCdcWatcherBuilder
 
         return new SqlCdcWatcher(
             options,
-            _stateStore ?? new InMemoryCdcStateStore(),
+            // A CDC cursor must survive a process restart.  Keeping it only in memory makes the
+            // otherwise innocuous default StartMode (FromNow) able to skip changes that arrived
+            // between runs.  The default store uses the very same factory as the poller, so it
+            // also shares its authentication and can save on the polling connection.
+            _stateStore ?? new SqlCdcStateStore(connections),
             _logger,
             leaseProvider,
             ownsLeaseProvider,

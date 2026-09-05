@@ -37,6 +37,12 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
     private readonly CdcWatcherOptions _options;
     private readonly ICdcStateStore _stateStore;
+
+    /// <summary>
+    /// The state store when it targets the same database as the poller, so watermarks can be
+    /// saved on the poll connection; <c>null</c> when it opens connections of its own.
+    /// </summary>
+    private readonly SqlCdcStateStore? _sharedConnectionStateStore;
     private readonly ICdcConnectionFactory _connections;
     private readonly ICdcLeaseProvider _leaseProvider;
     private readonly bool _ownsLeaseProvider;
@@ -122,6 +128,24 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         _ownsLeaseProvider = ownsLeaseProvider && leaseProvider is not null;
         _logger = logger ?? NullLogger<SqlCdcWatcher>.Instance;
 
+        // Saving on the poll connection is only correct when it reaches the same database as the
+        // store's own connections. A store pointed elsewhere — a separate operations database, say
+        // — would otherwise read from one place and write to another, and never find its
+        // watermark again after a restart.
+        if (stateStore is SqlCdcStateStore sqlStateStore)
+        {
+            if (sqlStateStore.SharesConnectionsWith(_connections))
+            {
+                _sharedConnectionStateStore = sqlStateStore;
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "The SQL state store opens its own connections rather than the watcher's; watermarks are " +
+                    "persisted on a separate connection per batch.");
+            }
+        }
+
         _channel = CreateChannel();
         SqlCdcDiagnostics.Register(this);
     }
@@ -206,7 +230,10 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             _crashed = false;
             _standbyLogged = false;
 
-            var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            // The token passed to StartAsync bounds startup work (capture-instance discovery).
+            // Once started, lifecycle is controlled by StopAsync; a caller's startup timeout must
+            // not silently stop an otherwise healthy watcher later.
+            var cts = new CancellationTokenSource();
             var token = cts.Token;
             _cts = cts;
             _pollTask = Task.Run(() => RunLoopAsync(token));
@@ -639,6 +666,9 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 SqlCdcDiagnostics.BatchRows.Record(batch.Rows.Count, TableTags(table));
 
                 var (timeMap, serverTime) = await MapLsnToTimeAsync(conn, batch.Rows.Select(r => r.Lsn), ct);
+                // Publishing and waiting for consumer acknowledgements can take arbitrarily long.
+                // Do not pin a SQL connection while the bounded channel applies backpressure.
+                await conn.CloseAsync();
                 var barrier = _options.CheckpointMode == CdcCheckpointMode.OnAcknowledgement
                     ? new CheckpointBarrier()
                     : null;
@@ -665,12 +695,18 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     await WaitForAcknowledgementsAsync(table, barrier, ct);
                 }
 
+                // The connection was deliberately released during delivery; reopen it only for
+                // the durable checkpoint and the next database operation.
+                await conn.OpenAsync(ct);
                 table.Watermark = batch.FullyConsumedLsn;
                 await SaveLastLsnAsync(conn, table.CaptureInstance, batch.FullyConsumedLsn, ct);
                 cursor = LsnHelpers.Increment(batch.FullyConsumedLsn);
             }
 
-            if (!batch.HitCap || table.Watermark is null || LsnHelpers.Compare(table.Watermark, maxLsn) >= 0)
+            // An empty batch cannot advance the cursor, so it must end the loop whatever HitCap
+            // says, or the poll would spin on the same range.
+            if (batch.Rows.Count == 0 || !batch.HitCap || table.Watermark is null
+                || LsnHelpers.Compare(table.Watermark, maxLsn) >= 0)
             {
                 break;
             }
@@ -692,7 +728,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     }
 
     private Task SaveLastLsnAsync(SqlConnection connection, string captureInstance, byte[] lsn, CancellationToken ct) =>
-        _stateStore is SqlCdcStateStore sqlStateStore
+        _sharedConnectionStateStore is { } sqlStateStore
             ? sqlStateStore.SaveLastLsnAsync(connection, captureInstance, lsn, ct)
             : _stateStore.SaveLastLsnAsync(captureInstance, lsn, ct);
 
@@ -784,16 +820,67 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Reads the next batch of the range. The query is bounded to one row past the batch size, so
+    /// the server never materialises — and the client never drains — the rest of a large backlog
+    /// on every poll. The one transaction the cap cannot bound is a single one larger than the
+    /// batch size: that is read in full, on its own, since splitting it would separate update
+    /// before/after images.
+    /// </summary>
     private async Task<ChangeBatch> ReadChangesAsync(
         SqlConnection conn, TableRuntime table, byte[] fromLsn, byte[] toLsn, CancellationToken ct)
     {
-        var functionName = $"cdc.{SqlIdentifier.Quote($"fn_cdc_get_all_changes_{table.CaptureInstance}", nameof(table.CaptureInstance))}";
-        var builder = new ChangeBatchBuilder(_options.BatchSize);
+        var batch = await QueryChangesAsync(conn, table, fromLsn, toLsn, _options.BatchSize, ct);
+        if (batch.Rows.Count > 0 || batch.PartialLsn is null)
+        {
+            return batch;
+        }
 
-        await using var cmd = new SqlCommand($"SELECT * FROM {functionName}(@from, @to, N'all update old')", conn);
+        // Bounding @to to the transaction's own LSN makes the range exactly that transaction:
+        // nothing precedes it in [fromLsn, PartialLsn], or the first query would have kept it.
+        var oversized = await QueryChangesAsync(conn, table, fromLsn, batch.PartialLsn, batchSize: null, ct);
+        if (oversized.Rows.Count == 0)
+        {
+            // The rows vanished between the two reads (cleanup job). Nothing to emit and no
+            // progress to record; the next poll re-evaluates the log bounds.
+            return oversized;
+        }
+
+        _logger.LogWarning(
+            "Capture instance {CaptureInstance}: a single transaction produced {RowCount} rows, " +
+            "exceeding the configured batch size of {BatchSize}. It is read in full to keep " +
+            "update before/after images together.",
+            table.CaptureInstance, oversized.Rows.Count, _options.BatchSize);
+
+        // The first query proved there is more beyond this transaction, so the poll continues.
+        return oversized with { HitCap = true };
+    }
+
+    /// <summary>
+    /// Runs the change function over a range in an explicit order, so a cap always falls on a
+    /// well-defined row, rows of one transaction stay contiguous and an update's before-image
+    /// precedes its after-image. The function does not expose <c>__$command_id</c>, so the order is
+    /// the one its documentation states: start LSN, sequence value, operation.
+    /// <paramref name="batchSize"/> <c>null</c> reads the range in full.
+    /// </summary>
+    private async Task<ChangeBatch> QueryChangesAsync(
+        SqlConnection conn, TableRuntime table, byte[] fromLsn, byte[] toLsn, int? batchSize, CancellationToken ct)
+    {
+        var functionName = $"cdc.{SqlIdentifier.Quote($"fn_cdc_get_all_changes_{table.CaptureInstance}", nameof(table.CaptureInstance))}";
+        var builder = new ChangeBatchBuilder(batchSize ?? int.MaxValue);
+
+        // One row past the cap: it is what tells a complete last transaction from a cut one.
+        var top = batchSize is { } size ? "TOP (@top) " : string.Empty;
+        await using var cmd = new SqlCommand(
+            $"SELECT {top}* FROM {functionName}(@from, @to, N'all update old') " +
+            "ORDER BY __$start_lsn, __$seqval, __$operation;", conn);
         cmd.CommandTimeout = CommandTimeoutSeconds;
         cmd.Parameters.Add("@from", SqlDbType.Binary, 10).Value = fromLsn;
         cmd.Parameters.Add("@to", SqlDbType.Binary, 10).Value = toLsn;
+        if (batchSize is { } cap)
+        {
+            cmd.Parameters.Add("@top", SqlDbType.BigInt).Value = (long)cap + 1;
+        }
 
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         var ordinal = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -810,17 +897,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             }
         }
 
-        var batch = builder.Build();
-        if (batch.Rows.Count > _options.BatchSize)
-        {
-            _logger.LogWarning(
-                "Capture instance {CaptureInstance}: a single transaction produced {RowCount} rows, " +
-                "exceeding the configured batch size of {BatchSize}. It is read in full to keep " +
-                "update before/after images together.",
-                table.CaptureInstance, batch.Rows.Count, _options.BatchSize);
-        }
-
-        return batch;
+        return builder.Build();
     }
 
     private static RawRow ReadRow(SqlDataReader reader, Dictionary<string, int> ordinal)

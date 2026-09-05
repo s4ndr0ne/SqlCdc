@@ -37,12 +37,20 @@ internal sealed class SqlCdcHostedService : BackgroundService
         // path, so a database that is briefly unavailable delays CDC instead of failing the host.
         await Task.Yield();
 
+        var hasHandlers = HasHandlers();
+        if (hasHandlers && _deadLetterSink is null)
+        {
+            throw new InvalidOperationException(
+                "CDC handlers are registered but no ICdcDeadLetterSink is configured. Register a durable " +
+                "dead-letter sink with AddCdcDeadLetterSink(...) before starting the host.");
+        }
+
         if (!await StartWatcherAsync(stoppingToken))
         {
             return;
         }
 
-        if (!HasHandlers())
+        if (!hasHandlers)
         {
             // No handlers registered: the application reads SqlCdcWatcher.Changes itself.
             _logger.LogInformation("No CDC handlers are registered; leaving channel consumption to the application.");
@@ -249,21 +257,32 @@ internal sealed class SqlCdcHostedService : BackgroundService
             return;
         }
 
-        try
+        // A configured dead-letter sink is the durable fallback for a failed handler.  Returning
+        // when it is unavailable would let DispatchAsync acknowledge the change and advance the
+        // CDC watermark, losing it permanently.  Keep this change unacknowledged until the sink
+        // accepts it; backpressure is preferable to a silent data loss.
+        for (var attempt = 1; ; attempt++)
         {
-            await _deadLetterSink.WriteAsync(deadLetter, ct);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            // Nothing left to fall back on: say so loudly rather than pretend the change was kept.
-            _logger.LogError(
-                ex,
-                "The dead-letter sink failed for change {ChangeKey} on {TableName}; the event is lost",
-                deadLetter.Change.Key, deadLetter.Change.TableName);
+            try
+            {
+                await _deadLetterSink.WriteAsync(deadLetter, ct);
+                return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                var delay = BackoffFor(attempt);
+                _logger.LogError(
+                    ex,
+                    "The dead-letter sink failed for change {ChangeKey} on {TableName} " +
+                    "(attempt {Attempt}); the change remains unacknowledged and will be retried in {RetryDelay}",
+                    deadLetter.Change.Key, deadLetter.Change.TableName, attempt, delay);
+
+                await Task.Delay(delay, ct);
+            }
         }
     }
 

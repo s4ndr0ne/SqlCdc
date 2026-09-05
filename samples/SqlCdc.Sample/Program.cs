@@ -36,6 +36,8 @@ await foreach (var change in watcher.Changes.WithCancellation(cts.Token))
             Console.WriteLine($"      {column} = {value ?? "NULL"}");
         }
     }
+
+    change.Acknowledge();
 }
 
 Console.WriteLine("Stopped.");

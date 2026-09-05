@@ -16,8 +16,8 @@ events (insert/update/delete with *before*/*after* images) and delivers them ove
 - Rich events: **before/after** image, operation type, LSN, commit time, and **update mask**.
 - Persistent LSN watermark: the watcher resumes exactly where it left off.
 - Bounded channel with backpressure: a slow consumer stalls the poller instead of losing events.
-- **Single active instance**: leader election over a SQL application lock, so a multi-replica
-  deployment does not emit every change N times.
+- **Single active instance by default**: leader election over a SQL application lock, so a
+  multi-replica deployment does not emit every change N times.
 - **At-least-once end to end**: an opt-in checkpoint mode that advances the watermark only once
   changes have actually been processed.
 - **Observable**: `Meter` and `ActivitySource` for OpenTelemetry, plus a health check that knows
@@ -53,7 +53,6 @@ var watcher = SqlCdcWatcherBuilder
     .WatchTable("dbo", "Orders")
     .WatchTable("dbo", "Customers")
     .WithPollInterval(TimeSpan.FromMilliseconds(250))
-    .UseStateStore(new SqlCdcStateStore(connectionString))  // resume after restart
     .Build();
 
 await watcher.StartAsync(cts.Token);
@@ -63,6 +62,7 @@ await foreach (var change in watcher.Changes.WithCancellation(cts.Token))
     Console.WriteLine($"{change.TableName} {change.Operation}");
     foreach (var (column, value) in change.After)
         Console.WriteLine($"  {column} = {value}");
+    change.Acknowledge();
 }
 ```
 
@@ -79,6 +79,7 @@ builder.Services.AddSqlCdc(cdc => cdc
     .UseStateStore(new SqlCdcStateStore(connectionString)));
 
 builder.Services.AddCdcChangeHandler<OrderChangedHandler>();
+builder.Services.AddCdcDeadLetterSink(new SqlCdcDeadLetterSink(connectionString));
 ```
 
 `AddSqlCdc` registers the watcher as a singleton and an `IHostedService` that starts it
@@ -222,11 +223,11 @@ record CdcChange
 | `WithBatchSize` | 1000 | Rows per cycle per table (soft cap, see below) |
 | `WithChannelCapacity` | 100 000 | Channel capacity (backpressure) |
 | `StartFrom` | `FromNow` | `FromNow` (skip history) or `FromBeginning` |
-| `UseStateStore` | in-memory | `SqlCdcStateStore` to persist the watermark LSN |
+| `UseStateStore` | SQL state store | Override the persistent `SqlCdcStateStore` used for the watermark LSN |
 | `WithRetryDelay` | 5 s | Delay after a polling error; doubles per consecutive failure, capped at 5 min |
 | `WithCommandTimeout` | 30 s | Timeout for each SQL round-trip against the CDC database |
-| `WithCheckpointMode` | `OnEmit` | When the watermark is persisted (see below) |
-| `UseSingleActiveInstance` | off | Elect one active watcher across replicas |
+| `WithCheckpointMode` | `OnAcknowledgement` | When the watermark is persisted (see below) |
+| `UseSingleActiveInstance` | on (`SqlCdc`) | Set a distinct lease name for an independent watcher |
 | `WithLeaseRetryDelay` | 10 s | How often a standby instance retries the lease |
 | `WithLeaseKeepaliveInterval` | 10 s | How often the active instance verifies it still holds the lease |
 | `WithHandlerRetry` | 1 attempt | Attempts per handler before a change is dead-lettered |
@@ -245,10 +246,9 @@ The channel is **bounded**: if the consumer falls behind, the poller blocks
 checkpoint modes a batch can be re-emitted after a restart.
 
 The pipeline understands only the operation values SQL Server emits (`__$operation` 1-4:
-insert, delete, update before/after image). A row with any other value — a newer engine
-behaviour or a corrupt row — cannot be turned into a `CdcChange`: it is skipped, counted in the
-`sqlcdc.skipped.rows` metric and reported with a warning, while the watermark still advances
-past it. The change is not delivered, so a non-zero count is worth an alert.
+insert, delete, update before/after image). An unsupported operation or an unpaired update image
+stops polling that capture instance without advancing its checkpoint. This preserves the data for
+investigation instead of silently losing a row.
 
 ### Checkpoint mode
 
@@ -257,18 +257,17 @@ resumes from.
 
 | Mode | Watermark advances | After a crash |
 |---|---|---|
-| `OnEmit` (default) | when the batch is written to the channel | changes still in the channel, or being handled, are **not** redelivered |
-| `OnAcknowledgement` | when every change of the batch has been acknowledged | the whole unacknowledged batch is redelivered |
+| `OnEmit` | when the batch is written to the channel | changes still in the channel, or being handled, are **not** redelivered |
+| `OnAcknowledgement` (default) | when every change of the batch has been acknowledged | the whole unacknowledged batch is redelivered |
 
-`OnEmit` is the cheapest and fine when losing an in-flight change is acceptable. Choose
-`OnAcknowledgement` for at-least-once delivery end to end:
+`OnAcknowledgement` is the default for at-least-once delivery end to end. Choose `OnEmit` only
+when losing an in-flight change is acceptable:
 
 ```csharp
 builder.Services.AddSqlCdc(cdc => cdc
     .UseConnectionString(connectionString)
     .WatchTable("dbo", "Orders")
-    .UseStateStore(new SqlCdcStateStore(connectionString))
-    .WithCheckpointMode(CdcCheckpointMode.OnAcknowledgement));
+    .WithCheckpointMode(CdcCheckpointMode.OnEmit));
 ```
 
 Registered `ICdcChangeHandler`s are acknowledged automatically, once every handler has been
@@ -292,15 +291,14 @@ pipeline. Retrying is the handler's responsibility.
 
 ### Running more than one instance
 
-By default the watcher assumes it is the only one: with several replicas, each would poll the
-same capture instances, deliver the same changes and overwrite the others' watermark.
-`UseSingleActiveInstance` elects one active watcher:
+By default the watcher elects one active instance using the `SqlCdc` lease. Set a distinct lease
+name when independent watchers share a database:
 
 ```csharp
 builder.Services.AddSqlCdc(cdc => cdc
     .UseConnectionString(connectionString)
     .WatchTable("dbo", "Orders")
-    .UseStateStore(new SqlCdcStateStore(connectionString))   // must be shared between instances
+    // The default SQL-backed state store is shared because all replicas use this database.
     .UseSingleActiveInstance());
 ```
 
@@ -318,10 +316,9 @@ the same change can be delivered more than once — during a takeover, or when a
 after a crash — so handlers and direct consumers must be idempotent.
 
 Standby instances retry every `WithLeaseRetryDelay` and expose `SqlCdcWatcher.IsLeader`. On
-taking over, a standby reloads the watermarks from the state store — which therefore has to be
-a shared one (`SqlCdcStateStore`, not the in-memory default) — and continues from where the
-previous leader had checkpointed. A graceful shutdown releases the lease, so failover is
-immediate rather than waiting for SQL Server to notice a dead session.
+taking over, a standby reloads the watermarks from the shared state store and continues from
+where the previous leader had checkpointed. A graceful shutdown releases the lease, so failover
+is immediate rather than waiting for SQL Server to notice a dead session.
 
 A standby that acquires the lease but then cannot read the watermarks — the shared state store's
 database is down, for instance — releases the lease again instead of holding it while delivering
@@ -381,8 +378,14 @@ fails `StartAsync` listing the ones that are, instead of failing on every poll w
 lock, so concurrent writers cannot both decide the row is missing and collide on the primary
 key. The write is also **monotonic**: a lower LSN is a no-op rather than a rewind, so a watcher
 that lost its lease with a save already in flight cannot drag the new leader backwards.
-`InMemoryCdcStateStore` behaves the same way, so swapping stores does not change what is
-replayed.
+It is the builder default and is created automatically in the watched database. Use
+`InMemoryCdcStateStore` only for tests or deliberately ephemeral consumers: its checkpoint is
+lost when the process exits.
+
+When the store is built on the same connection string (or the same connection factory instance)
+as the watcher, watermarks are saved on the poll connection, so a batch costs no extra
+connection. A store pointed at a different database, or authenticating differently, is honoured
+as such: it opens its own connection per save.
 
 Both the watermark table and the dead-letter table are created on first use. Where the
 application has no DDL rights at runtime, provision them with
@@ -419,11 +422,14 @@ must never block everything queued behind it.
 `SqlCdcDeadLetterSink` writes to `dbo.cdc_dead_letter` (created automatically), keeping the
 before/after images as JSON alongside the handler name, the attempt count and the last
 exception — enough to inspect and replay. Implement `ICdcDeadLetterSink` to send them anywhere
-else. A sink that throws is logged and the change is dropped: an unavailable sink slows nothing
-down, but it does mean the dead letter itself is lost, so keep the write cheap.
+else. If a configured sink is temporarily unavailable, its write is retried with exponential
+backoff and the change remains unacknowledged; delivery pauses rather than losing the event.
 
-Retries and dead-lettering apply to handlers registered with `AddCdcChangeHandler`. Code that
-reads `watcher.Changes` directly owns its own error handling.
+Handlers require an `ICdcDeadLetterSink`; the hosted service rejects an unsafe configuration at
+startup rather than acknowledging a failed handler with nowhere durable to record it. Retries and
+dead-lettering apply to handlers registered with `AddCdcChangeHandler`. Code that reads
+`watcher.Changes` directly owns its own error handling and must call `Acknowledge()` for every
+change under the default checkpoint mode.
 
 ## Observability
 
@@ -512,4 +518,3 @@ SQLCDC_CONNECTION="Server=.;Database=MyDb;User Id=sa;Password=...;TrustServerCer
 ```
 
 See `scripts/enable-cdc.sql` to enable CDC on a sample table.
-

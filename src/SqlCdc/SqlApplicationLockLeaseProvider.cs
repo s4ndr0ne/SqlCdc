@@ -77,13 +77,6 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
             : connections;
         _logger = logger ?? NullLogger<SqlApplicationLockLeaseProvider>.Instance;
 
-        if (connections is not SqlCdcConnectionFactory)
-        {
-            _logger.LogInformation(
-                "The CDC lease will be held on a connection from a custom factory. Make sure that connection is " +
-                "opened with pooling disabled: a pooled connection released back to the pool can keep holding the " +
-                "session lock until it is reused, which delays failover.");
-        }
     }
 
     /// <summary>The application lock resource this provider contends on.</summary>
@@ -289,6 +282,16 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
         _connection = null;
         if (connection is not null)
         {
+            // A custom factory can hand out a pooled connection. Clear its pool before returning
+            // it, so a session-scoped application lock can never survive disposal in an idle pool.
+            try
+            {
+                SqlConnection.ClearPool(connection);
+            }
+            catch
+            {
+                // Best effort for broken connections; DisposeAsync below still releases normal ones.
+            }
             await connection.DisposeAsync();
         }
     }

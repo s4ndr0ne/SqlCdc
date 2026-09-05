@@ -21,8 +21,8 @@ public sealed record CdcDeadLetter(
 /// </summary>
 /// <remarks>
 /// The sink is on the delivery path: it is awaited before the next change is dispatched. A sink
-/// that throws is logged and the change is dropped, so an unavailable sink never stalls the
-/// pipeline — but it does mean the dead letter itself can be lost. Keep the write cheap.
+/// that throws is retried and keeps the change unacknowledged, so an unavailable sink applies
+/// backpressure rather than losing the dead letter. Keep the write cheap.
 /// </remarks>
 public interface ICdcDeadLetterSink
 {

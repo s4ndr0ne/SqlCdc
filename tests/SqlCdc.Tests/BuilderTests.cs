@@ -29,6 +29,22 @@ public class BuilderTests
         Assert.False(watcher.IsRunning);
     }
 
+    [Fact]
+    public void Build_WithoutAnExplicitStateStore_UsesSqlStateStore()
+    {
+        var watcher = SqlCdcWatcherBuilder
+            .Create()
+            .UseConnectionString("Server=.;Database=x")
+            .WatchTable("dbo", "Orders")
+            .Build();
+
+        var stateStore = typeof(SqlCdcWatcher)
+            .GetField("_stateStore", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?.GetValue(watcher);
+
+        Assert.IsType<SqlCdcStateStore>(stateStore);
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(-1)]
@@ -142,15 +158,15 @@ public class BuilderTests
     [Fact]
     public void Options_DefaultToTheSingleInstanceBehaviour()
     {
-        // Leader election and acknowledgement checkpointing are both opt-in, so an existing
-        // single-instance deployment behaves exactly as before.
+        // Checkpointing is safe by default. Leader election is constructed by the builder because
+        // it needs a connection factory, so these options only cover its timing defaults.
         var options = new CdcWatcherOptions
         {
             ConnectionString = "Server=.;Database=x",
             Tables = [new CdcTableSubscription("dbo", "Orders")],
         };
 
-        Assert.Equal(CdcCheckpointMode.OnEmit, options.CheckpointMode);
+        Assert.Equal(CdcCheckpointMode.OnAcknowledgement, options.CheckpointMode);
         Assert.Equal(TimeSpan.FromSeconds(10), options.LeaseRetryDelay);
         Assert.Equal(TimeSpan.FromSeconds(10), options.LeaseKeepaliveInterval);
         Assert.Equal(1, options.MaxHandlerAttempts);

@@ -19,6 +19,7 @@ internal static class ChangeCollector
             await foreach (var change in watcher.Changes.WithCancellation(cts.Token))
             {
                 collected.Add(change);
+                change.Acknowledge();
                 if (until(change))
                 {
                     break;

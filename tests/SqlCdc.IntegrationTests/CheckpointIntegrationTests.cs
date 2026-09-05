@@ -72,6 +72,7 @@ public class CheckpointIntegrationTests
         builder.Services.AddSingleton<ChangeSink>();
         builder.Services.AddScoped<ScopeMarker>();
         builder.Services.AddCdcChangeHandler<CollectingHandler>();
+        builder.Services.AddCdcDeadLetterSink(new SqlCdcDeadLetterSink(_sql.ConnectionString));
         builder.Services.AddSqlCdc(cdc => cdc
             .UseConnectionString(_sql.ConnectionString)
             .WatchTable("dbo", table)

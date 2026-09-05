@@ -25,6 +25,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Catching up on a large backlog cost time quadratic in its size: the batch cap stopped reading
+  after `WithBatchSize` rows, but the query still returned the whole remaining range and the
+  client drained it on every poll. The change function is now queried with `TOP (BatchSize + 1)`
+  in the change table's clustered order, so each poll transfers one batch. A single transaction
+  larger than the batch size is still read in full, in a second query bounded to its own LSN.
+- With a `SqlCdcStateStore` pointed at a different database (or credentials) than the watched
+  one, watermarks were read through the store's connection but written on the poll connection —
+  into the wrong database — and never found again after a restart. The poll connection is now
+  reused only when the store targets the same connection string and token callback, or the very
+  same connection factory instance; otherwise the store opens its own connection per save.
 - CDC rows with an unsupported `__$operation` value were dropped silently while the watermark
   still advanced past them. They are now counted in `sqlcdc.skipped.rows` and reported with a
   warning (one per operation value), so the loss is visible in logs and metrics.

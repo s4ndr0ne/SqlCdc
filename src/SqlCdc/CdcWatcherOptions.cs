@@ -56,9 +56,9 @@ public sealed class CdcWatcherOptions
     public TimeSpan CommandTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// When the watermark LSN is persisted. Defaults to <see cref="CdcCheckpointMode.OnEmit"/>.
+    /// When the watermark LSN is persisted. Defaults to <see cref="CdcCheckpointMode.OnAcknowledgement"/>.
     /// </summary>
-    public CdcCheckpointMode CheckpointMode { get; set; } = CdcCheckpointMode.OnEmit;
+    public CdcCheckpointMode CheckpointMode { get; set; } = CdcCheckpointMode.OnAcknowledgement;
 
     /// <summary>
     /// Delay before trying the lease again while another instance holds it. Defaults to 10 seconds,

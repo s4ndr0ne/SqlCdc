@@ -69,15 +69,11 @@ public class CdcChangePairerTests
     }
 
     [Fact]
-    public void Update_WithoutBeforeImage_HasEmptyBefore()
+    public void Update_WithoutBeforeImage_FailsWithoutAdvancingTheCheckpoint()
     {
         var after = Row(4, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 12.50m)));
 
-        var change = Assert.Single(Pair(after));
-
-        Assert.Equal(CdcOperationType.Update, change.Operation);
-        Assert.Empty(change.Before);
-        Assert.Equal(12.50m, change.After["Price"]);
+        Assert.Throws<InvalidOperationException>(() => Pair(after));
     }
 
     [Fact]
@@ -243,54 +239,41 @@ public class CdcChangePairerTests
     // --- __$operation values outside 1-4 ---------------------------------------------
 
     [Fact]
-    public void UnknownOperation_IsSkipped_WithoutThrowing()
+    public void UnknownOperation_FailsWithoutAdvancingTheCheckpoint()
     {
         var row = Row(5, values: Values(("Id", 1)));
 
-        Assert.Empty(Pair(row));
+        Assert.Throws<InvalidOperationException>(() => Pair(row));
     }
 
     [Fact]
-    public void UnknownOperation_DoesNotBreakBeforeAfterPairing()
+    public void UnknownOperation_StopsPairing()
     {
         var before = Row(3, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 9.99m)));
         var unknown = Row(5, seqVal: before.SeqVal, values: Values(("Id", 1)));
         var after = Row(4, seqVal: before.SeqVal, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 12.50m)),
             mask: new byte[] { 0b0000_0100 });
 
-        var change = Assert.Single(Pair(before, unknown, after));
-
-        Assert.Equal(CdcOperationType.Update, change.Operation);
-        Assert.Equal(9.99m, change.Before["Price"]);
-        Assert.Equal(12.50m, change.After["Price"]);
+        Assert.Throws<InvalidOperationException>(() => Pair(before, unknown, after));
     }
 
     [Fact]
-    public void OrphanBeforeImage_IsSkipped_WithAWarning()
+    public void OrphanBeforeImage_FailsWithoutAdvancingTheCheckpoint()
     {
         var logger = new RecordingLogger();
         var before = Row(3, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 9.99m)));
 
-        // A before-image with no after-image never comes out of SQL Server, but if it did, it must
-        // be reported like any other skipped row rather than vanish without a trace.
-        Assert.Empty(Pair(logger, before));
-
-        var entry = Assert.Single(logger.Entries);
-        Assert.Equal(LogLevel.Warning, entry.Level);
-        Assert.Contains("before-image", entry.Message);
+        Assert.Throws<InvalidOperationException>(() => Pair(logger, before));
     }
 
     [Fact]
-    public void UnknownOperation_WarnsOncePerOperationValue()
+    public void UnknownOperation_FailsAtTheFirstInvalidRow()
     {
         var logger = new RecordingLogger();
         var first = Row(5, seqVal: new byte[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, values: Values(("Id", 1)));
         var second = Row(5, seqVal: new byte[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 }, values: Values(("Id", 2)));
 
-        Assert.Empty(Pair(logger, first, second));
-
-        var entry = Assert.Single(logger.Entries);
-        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Throws<InvalidOperationException>(() => Pair(logger, first, second));
     }
 
     private static List<CdcChange> Pair(ILogger logger, params RawRow[] rows) =>

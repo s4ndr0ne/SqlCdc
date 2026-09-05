@@ -26,6 +26,7 @@ public class HostedServiceIntegrationTests
         if (withHandler)
         {
             builder.Services.AddCdcChangeHandler<CollectingHandler>();
+            builder.Services.AddCdcDeadLetterSink(new SqlCdcDeadLetterSink(_sql.ConnectionString));
         }
 
         return builder.Build();

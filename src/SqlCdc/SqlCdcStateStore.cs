@@ -67,6 +67,17 @@ public sealed class SqlCdcStateStore : ICdcStateStore
     private string TableName =>
         $"{SqlIdentifier.Quote(_schema, nameof(_schema))}.{SqlIdentifier.Quote(_table, nameof(_table))}";
 
+    /// <summary>
+    /// Whether a connection opened by <paramref name="connections"/> reaches the same database as
+    /// this store's own, so the store may write on it. This is what lets the watcher save
+    /// watermarks on its poll connection instead of opening one per batch.
+    /// </summary>
+    internal bool SharesConnectionsWith(ICdcConnectionFactory connections) =>
+        ReferenceEquals(_connections, connections)
+        || (_connections is SqlCdcConnectionFactory own
+            && connections is SqlCdcConnectionFactory other
+            && own.OpensSameConnectionsAs(other));
+
     public async Task<byte[]?> GetLastLsnAsync(string captureInstance, CancellationToken cancellationToken = default)
     {
         for (var attempt = 0; ; attempt++)

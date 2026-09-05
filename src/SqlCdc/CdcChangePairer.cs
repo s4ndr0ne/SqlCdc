@@ -1,12 +1,18 @@
 namespace SqlCdc;
 
-using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
 /// Pairs CDC log rows (operations 3+4) into single update events and maps
 /// raw rows to <see cref="CdcChange"/> events.
 /// </summary>
+/// <remarks>
+/// Pairing does not depend on the order rows arrive in within a transaction: an after-image
+/// that shows up before its before-image is held until the pair is complete. The rows of one
+/// transaction only have to be in the same batch, which <see cref="ChangeBatchBuilder"/>
+/// guarantees. This is what lets the poller order its query on the start LSN alone and read the
+/// change table in index order rather than sorting the range on every poll.
+/// </remarks>
 internal static class CdcChangePairer
 {
     private static readonly IReadOnlyDictionary<string, object?> EmptyValues =
@@ -25,38 +31,44 @@ internal static class CdcChangePairer
         ILogger? logger = null)
     {
         var pendingBefore = new Dictionary<string, RawRow>(StringComparer.OrdinalIgnoreCase);
+        var pendingAfter = new Dictionary<string, RawRow>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var row in rows)
         {
             var key = Convert.ToHexString(row.SeqVal);
-            var commitTime = timeMap.TryGetValue(Convert.ToHexString(row.Lsn), out var t) ? t : DateTime.MinValue;
 
             switch (row.Operation)
             {
                 case 1: // delete
-                    yield return Create(schema, table, captureInstance, row, CdcOperationType.Delete, row.Values, EmptyValues, EmptyMask, commitTime);
+                    yield return Create(schema, table, captureInstance, row, CdcOperationType.Delete, row.Values, EmptyValues, EmptyMask, CommitTimeOf(row, timeMap));
                     break;
 
                 case 2: // insert
-                    yield return Create(schema, table, captureInstance, row, CdcOperationType.Insert, EmptyValues, row.Values, EmptyMask, commitTime);
+                    yield return Create(schema, table, captureInstance, row, CdcOperationType.Insert, EmptyValues, row.Values, EmptyMask, CommitTimeOf(row, timeMap));
                     break;
 
                 case 3: // update before-image
-                    pendingBefore[key] = row;
+                    if (pendingAfter.Remove(key, out var after))
+                    {
+                        yield return CreateUpdate(schema, table, captureInstance, capturedColumns, row, after, timeMap);
+                    }
+                    else
+                    {
+                        pendingBefore[key] = row;
+                    }
+
                     break;
 
                 case 4: // update after-image
-                    if (!pendingBefore.Remove(key, out var before))
+                    if (pendingBefore.Remove(key, out var before))
                     {
-                        throw new InvalidOperationException(
-                            $"Capture instance '{captureInstance}' produced an update after-image without a matching before-image.");
+                        yield return CreateUpdate(schema, table, captureInstance, capturedColumns, before, row, timeMap);
                     }
-                    yield return Create(
-                        schema, table, captureInstance, row, CdcOperationType.Update,
-                        before?.Values ?? EmptyValues,
-                        row.Values,
-                        ComputeMask(capturedColumns, row.UpdateMask),
-                        commitTime);
+                    else
+                    {
+                        pendingAfter[key] = row;
+                    }
+
                     break;
 
                 default:
@@ -66,13 +78,34 @@ internal static class CdcChangePairer
             }
         }
 
-        if (pendingBefore.Count > 0)
+        // Both images of an update belong to the same transaction, and batches are cut on
+        // transaction boundaries, so leftovers mean the source produced something unexpected.
+        if (pendingBefore.Count > 0 || pendingAfter.Count > 0)
         {
             throw new InvalidOperationException(
                 $"Capture instance '{captureInstance}' produced {pendingBefore.Count} update before-image row(s) " +
-                "without a matching after-image. The checkpoint was not advanced, so no change is silently lost.");
+                $"without a matching after-image and {pendingAfter.Count} after-image row(s) without a matching " +
+                "before-image. The checkpoint was not advanced, so no change is silently lost.");
         }
     }
+
+    private static DateTime CommitTimeOf(RawRow row, IReadOnlyDictionary<string, DateTime> timeMap) =>
+        timeMap.TryGetValue(Convert.ToHexString(row.Lsn), out var t) ? t : DateTime.MinValue;
+
+    private static CdcChange CreateUpdate(
+        string schema,
+        string table,
+        string captureInstance,
+        IReadOnlyList<string> capturedColumns,
+        RawRow before,
+        RawRow after,
+        IReadOnlyDictionary<string, DateTime> timeMap) =>
+        Create(
+            schema, table, captureInstance, after, CdcOperationType.Update,
+            before.Values,
+            after.Values,
+            ComputeMask(capturedColumns, after.UpdateMask),
+            CommitTimeOf(after, timeMap));
 
     private static CdcChange Create(
         string schema,
@@ -106,8 +139,8 @@ internal static class CdcChangePairer
         var result = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         for (var i = 0; i < columns.Count; i++)
         {
-            // __$update_mask è indicizzata dalla fine: l'ordinale 1 è il bit meno
-            // significativo dell'ultimo byte dell'array (cfr. sys.fn_cdc_is_bit_set).
+            // __$update_mask is indexed from the end: ordinal 1 is the least significant bit of
+            // the last byte of the array (see sys.fn_cdc_is_bit_set).
             var byteIndex = mask.Length - 1 - (i / 8);
             var updated = byteIndex >= 0 && ((mask[byteIndex] >> (i % 8)) & 1) == 1;
             result[columns[i]] = updated;

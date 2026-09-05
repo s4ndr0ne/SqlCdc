@@ -48,7 +48,12 @@ public static class SqlCdcDiagnostics
     /// <summary>Changes that exhausted their attempts and were dead-lettered or dropped.</summary>
     public const string DeadLettersMetric = "sqlcdc.dead_letters";
 
-    /// <summary>CDC log rows skipped because their <c>__$operation</c> value is not supported.</summary>
+    /// <summary>
+    /// No longer emitted. A CDC row with an unsupported <c>__$operation</c> value, or an update
+    /// image without its counterpart, now fails the poll of its capture instance instead of being
+    /// skipped, so it shows up in <see cref="PollFailuresMetric"/> and the health check.
+    /// </summary>
+    [Obsolete("No longer emitted: unsupported rows fail the poll and count in " + PollFailuresMetric + ".")]
     public const string SkippedRowsMetric = "sqlcdc.skipped.rows";
 
     /// <summary>Changes currently queued on the channel: the consumer's backlog.</summary>
@@ -56,6 +61,12 @@ public static class SqlCdcDiagnostics
 
     /// <summary>1 while the watcher holds the lease and polls, 0 while it stands by.</summary>
     public const string LeaderMetric = "sqlcdc.leader";
+
+    /// <summary>
+    /// Attempts to acquire or verify the lease that failed with an error. A standby waiting its
+    /// turn does not count; a rising count means the instance cannot reach the database at all.
+    /// </summary>
+    public const string LeaseFailuresMetric = "sqlcdc.lease.failures";
 
     private static readonly string? Version = typeof(SqlCdcDiagnostics).Assembly.GetName().Version?.ToString();
 
@@ -95,8 +106,8 @@ public static class SqlCdcDiagnostics
     internal static readonly Counter<long> DeadLetters = Meter.CreateCounter<long>(
         DeadLettersMetric, "{change}", "Changes that exhausted their attempts.");
 
-    internal static readonly Counter<long> SkippedRows = Meter.CreateCounter<long>(
-        SkippedRowsMetric, "{row}", "CDC log rows skipped because their operation is not supported.");
+    internal static readonly Counter<long> LeaseFailures = Meter.CreateCounter<long>(
+        LeaseFailuresMetric, "{failure}", "Attempts to acquire or verify the lease that failed with an error.");
 
     private static readonly ObservableGauge<int> ChannelLength = Meter.CreateObservableGauge(
         ChannelLengthMetric, ObserveChannelLength, "{change}", "Changes queued on the channel.");

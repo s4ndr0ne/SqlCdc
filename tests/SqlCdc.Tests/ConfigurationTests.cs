@@ -176,9 +176,43 @@ public class ConfigurationTests
             ["SqlCdc:LeaseName"] = "sales",
         });
 
-        // The lease is only taken once the loop runs, so all that can be asserted here is that
-        // building with it configured succeeds and the watcher starts out as a standby.
+        var lease = Assert.IsType<SqlApplicationLockLeaseProvider>(watcher.LeaseProvider);
+        Assert.Equal("SqlCdc:sales", lease.ResourceName);
         Assert.False(watcher.IsLeader);
+    }
+
+    [Fact]
+    public void SingleActiveInstanceFalse_RunsWithoutALease()
+    {
+        var watcher = Build(new Dictionary<string, string?>
+        {
+            ["SqlCdc:ConnectionString"] = ConnectionString,
+            ["SqlCdc:Tables:0:Table"] = "Orders",
+            ["SqlCdc:SingleActiveInstance"] = "false",
+        });
+
+        Assert.IsType<NullCdcLeaseProvider>(watcher.LeaseProvider);
+    }
+
+    [Fact]
+    public void SingleActiveInstanceFalseInConfig_ConflictsWithALeaseProviderFromTheContainer()
+    {
+        // Turning election off in the section while the container registers a provider is as
+        // contradictory as turning the built-in one on: neither side should win silently.
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["SqlCdc:ConnectionString"] = ConnectionString,
+            ["SqlCdc:Tables:0:Table"] = "Orders",
+            ["SqlCdc:SingleActiveInstance"] = "false",
+        }).Build();
+        var services = new ServiceCollection();
+        services.AddSingleton<ICdcLeaseProvider>(new SqlApplicationLockLeaseProvider(ConnectionString));
+        services.AddSqlCdc(configuration.GetSection("SqlCdc"));
+
+        var error = Assert.Throws<InvalidOperationException>(
+            () => services.BuildServiceProvider().GetRequiredService<SqlCdcWatcher>());
+
+        Assert.Contains("SingleActiveInstance", error.Message);
     }
 
     private static SqlCdcWatcher Build(

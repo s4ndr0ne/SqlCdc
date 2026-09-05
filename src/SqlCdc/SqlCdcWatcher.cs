@@ -57,6 +57,15 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     private bool _standbyLogged;
     private long _lastLeaseCheckTick;
 
+    /// <summary>
+    /// Attempts to acquire or verify the lease that failed with an error, in a row. "Another
+    /// instance holds it" is not a failure. Read by GetStatus from another thread.
+    /// </summary>
+    private int _leaseFailures;
+
+    /// <summary>UTC ticks of when this instance last became a standby; 0 while it is the leader.</summary>
+    private long _standbySinceTicks;
+
     internal SqlCdcWatcher(
         CdcWatcherOptions options,
         ICdcStateStore stateStore,
@@ -156,6 +165,12 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// <summary>The effective options for this watcher.</summary>
     internal CdcWatcherOptions Options => _options;
 
+    /// <summary>The state store watermarks are read from and saved to.</summary>
+    internal ICdcStateStore StateStore => _stateStore;
+
+    /// <summary>The lease provider gating the poll; <see cref="NullCdcLeaseProvider"/> without election.</summary>
+    internal ICdcLeaseProvider LeaseProvider => _leaseProvider;
+
     private int CommandTimeoutSeconds =>
         (int)Math.Clamp(Math.Ceiling(_options.CommandTimeout.TotalSeconds), 1, int.MaxValue);
 
@@ -229,6 +244,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             _isLeader = false;
             _crashed = false;
             _standbyLogged = false;
+            Volatile.Write(ref _leaseFailures, 0);
+            Volatile.Write(ref _standbySinceTicks, DateTimeOffset.UtcNow.UtcTicks);
 
             // The token passed to StartAsync bounds startup work (capture-instance discovery).
             // Once started, lifecycle is controlled by StopAsync; a caller's startup timeout must
@@ -328,7 +345,14 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             .OrderBy(t => t.CaptureInstance, StringComparer.Ordinal)
             .ToList();
 
-        return new CdcWatcherStatus(Name, IsRunning, IsLeader, _channel.Reader.Count, tables);
+        var standbySinceTicks = Volatile.Read(ref _standbySinceTicks);
+        return new CdcWatcherStatus(Name, IsRunning, IsLeader, _channel.Reader.Count, tables)
+        {
+            ConsecutiveLeaseFailures = Volatile.Read(ref _leaseFailures),
+            StandbySince = IsLeader || standbySinceTicks == 0
+                ? null
+                : new DateTimeOffset(standbySinceTicks, TimeSpan.Zero),
+        };
     }
 
     /// <summary>
@@ -342,7 +366,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             return;
         }
 
-        _isLeader = false;
+        StepDown();
         try
         {
             await _leaseProvider.ReleaseAsync(cancellationToken);
@@ -385,6 +409,14 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     if (ct.IsCancellationRequested)
                     {
                         return;
+                    }
+
+                    // The previous table may have waited a long time on its consumer, long enough
+                    // for the lease to have gone elsewhere. Throttled by the keepalive interval, so
+                    // in the normal case this costs nothing.
+                    if (!await VerifyLeaseAsync(ct))
+                    {
+                        break;
                     }
 
                     // A table that just failed backs off on its own, so a single broken capture
@@ -467,37 +499,17 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// </summary>
     private async Task<bool> EnsureLeadershipAsync(CancellationToken ct)
     {
+        if (_isLeader)
+        {
+            return await VerifyLeaseAsync(ct);
+        }
+
         try
         {
-            if (_isLeader)
-            {
-                // The lease is only verified every LeaseKeepaliveInterval, not on every polling
-                // cycle: with a short poll interval the keepalive would otherwise dominate the
-                // traffic on the lease connection. The trade-off is that a lost lease can go
-                // unnoticed for up to one interval, during which the monotonic watermark keeps
-                // the old and the new leader from rewinding each other.
-                var elapsedMs = Environment.TickCount64 - _lastLeaseCheckTick;
-                if (elapsedMs < _options.LeaseKeepaliveInterval.TotalMilliseconds)
-                {
-                    return true;
-                }
-
-                if (await _leaseProvider.IsHeldAsync(ct))
-                {
-                    _lastLeaseCheckTick = Environment.TickCount64;
-                    return true;
-                }
-
-                _isLeader = false;
-                _standbyLogged = false;
-                _logger.LogWarning(
-                    "Lost the CDC lease; polling is paused until it is re-acquired. " +
-                    "Another instance may have taken over.");
-                return false;
-            }
-
             if (!await _leaseProvider.TryAcquireAsync(ct))
             {
+                // Another instance holds the lease: the expected state of a standby, not an error.
+                Volatile.Write(ref _leaseFailures, 0);
                 if (!_standbyLogged)
                 {
                     _standbyLogged = true;
@@ -538,6 +550,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
             _lastLeaseCheckTick = Environment.TickCount64;
             _standbyLogged = false;
+            Volatile.Write(ref _leaseFailures, 0);
+            Volatile.Write(ref _standbySinceTicks, 0);
             _logger.LogInformation("Acquired the CDC lease; this instance is now the active watcher.");
             return true;
         }
@@ -547,13 +561,85 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _isLeader = false;
-            _logger.LogError(
-                ex,
-                "Could not establish the CDC lease; retrying in {LeaseRetryDelay}. No change events are being delivered.",
-                _options.LeaseRetryDelay);
+            RecordLeaseFailure(ex);
             return false;
         }
+    }
+
+    /// <summary>
+    /// Confirms this instance still holds the lease, and steps down when it does not or cannot
+    /// tell. The lease is only verified every <see cref="CdcWatcherOptions.LeaseKeepaliveInterval"/>:
+    /// with a short poll interval the keepalive would otherwise dominate the traffic on the lease
+    /// connection. The trade-off is that a lost lease can go unnoticed for up to one interval,
+    /// during which the monotonic watermark keeps the old and the new leader from rewinding each
+    /// other. Called between tables and between batches as well as at the top of the cycle, so a
+    /// wait on a slow consumer that outlasts the interval is followed by a real check rather than
+    /// by more batches from an instance that may no longer be the leader.
+    /// </summary>
+    private async Task<bool> VerifyLeaseAsync(CancellationToken ct)
+    {
+        if (!_isLeader)
+        {
+            return false;
+        }
+
+        var elapsedMs = Environment.TickCount64 - _lastLeaseCheckTick;
+        if (elapsedMs < _options.LeaseKeepaliveInterval.TotalMilliseconds)
+        {
+            return true;
+        }
+
+        try
+        {
+            if (await _leaseProvider.IsHeldAsync(ct))
+            {
+                _lastLeaseCheckTick = Environment.TickCount64;
+                Volatile.Write(ref _leaseFailures, 0);
+                return true;
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Unable to tell is treated as lost: the lease lives on a connection, and a connection
+            // that cannot answer may well have dropped it already.
+            StepDown();
+            RecordLeaseFailure(ex);
+            return false;
+        }
+
+        StepDown();
+        _logger.LogWarning(
+            "Lost the CDC lease; polling is paused until it is re-acquired. " +
+            "Another instance may have taken over.");
+        return false;
+    }
+
+    /// <summary>Leaves the leader role; the time is recorded so the health check can see how long the standby lasts.</summary>
+    private void StepDown()
+    {
+        _isLeader = false;
+        _standbyLogged = false;
+        Volatile.Write(ref _standbySinceTicks, DateTimeOffset.UtcNow.UtcTicks);
+    }
+
+    /// <summary>
+    /// Counts an attempt to acquire or verify the lease that failed with an error, so a standby
+    /// that cannot reach the database is told apart — in metrics and in the health check — from
+    /// one that is simply waiting for its turn.
+    /// </summary>
+    private void RecordLeaseFailure(Exception ex)
+    {
+        var failures = Interlocked.Increment(ref _leaseFailures);
+        SqlCdcDiagnostics.LeaseFailures.Add(1, new TagList { { "watcher", _options.Name } });
+        _logger.LogError(
+            ex,
+            "Could not establish or verify the CDC lease ({ConsecutiveFailures} consecutive failures); retrying in " +
+            "{LeaseRetryDelay}. No change events are being delivered by this instance.",
+            failures, _options.LeaseRetryDelay);
     }
 
     /// <summary>
@@ -666,9 +752,6 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 SqlCdcDiagnostics.BatchRows.Record(batch.Rows.Count, TableTags(table));
 
                 var (timeMap, serverTime) = await MapLsnToTimeAsync(conn, batch.Rows.Select(r => r.Lsn), ct);
-                // Publishing and waiting for consumer acknowledgements can take arbitrarily long.
-                // Do not pin a SQL connection while the bounded channel applies backpressure.
-                await conn.CloseAsync();
                 var barrier = _options.CheckpointMode == CdcCheckpointMode.OnAcknowledgement
                     ? new CheckpointBarrier()
                     : null;
@@ -680,7 +763,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     // Registered before the change is written: once it is on the channel a consumer
                     // can acknowledge it at any moment, and the barrier must already know about it.
                     var published = barrier is null ? change : change with { Acknowledgement = barrier.Register() };
-                    await WriteToChannelAsync(table, published, ct);
+                    await WriteToChannelAsync(table, published, conn, ct);
 
                     emitted++;
                     RecordEmitted(table, published, serverTime);
@@ -692,15 +775,28 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 if (barrier is not null)
                 {
                     barrier.Seal();
-                    await WaitForAcknowledgementsAsync(table, barrier, ct);
+                    await WaitForAcknowledgementsAsync(table, barrier, conn, ct);
                 }
 
-                // The connection was deliberately released during delivery; reopen it only for
-                // the durable checkpoint and the next database operation.
-                await conn.OpenAsync(ct);
+                // Delivery that stalled long enough gave the connection back (see
+                // ReleaseConnectionWhileBlockedAsync); take one again for the checkpoint and the rest
+                // of the poll. The usual fast path never closed it and skips this.
+                if (conn.State != ConnectionState.Open)
+                {
+                    await conn.OpenAsync(ct);
+                }
+
                 table.Watermark = batch.FullyConsumedLsn;
                 await SaveLastLsnAsync(conn, table.CaptureInstance, batch.FullyConsumedLsn, ct);
                 cursor = LsnHelpers.Increment(batch.FullyConsumedLsn);
+
+                // The wait above may have outlasted the lease. The batch is checkpointed either way
+                // (the save is monotonic), but the next one must not be read by an instance that is
+                // no longer the leader. Throttled, so a fast batch costs nothing here.
+                if (!await VerifyLeaseAsync(ct))
+                {
+                    return;
+                }
             }
 
             // An empty batch cannot advance the cursor, so it must end the loop whatever HitCap
@@ -765,7 +861,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// consumer otherwise parks the poller inside the write with nothing in the logs — the
     /// acknowledgement warning never fires because the batch is still being published.
     /// </summary>
-    private async Task WriteToChannelAsync(TableRuntime table, CdcChange change, CancellationToken ct)
+    private async Task WriteToChannelAsync(TableRuntime table, CdcChange change, SqlConnection conn, CancellationToken ct)
     {
         var write = _channel.Writer.WriteAsync(change, ct);
         if (write.IsCompletedSuccessfully)
@@ -785,6 +881,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             catch (TimeoutException)
             {
                 waited += CheckpointWarningInterval;
+                await ReleaseConnectionWhileBlockedAsync(table, conn);
                 _logger.LogWarning(
                     "Capture instance {CaptureInstance}: the channel has been full for {Waited} and polling is " +
                     "blocked. Is the consumer still reading? {QueuedChanges} change(s) are waiting to be consumed.",
@@ -798,7 +895,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// that never acknowledges pauses polling for that table indefinitely, so the wait is reported
     /// periodically rather than left silent.
     /// </summary>
-    private async Task WaitForAcknowledgementsAsync(TableRuntime table, CheckpointBarrier barrier, CancellationToken ct)
+    private async Task WaitForAcknowledgementsAsync(
+        TableRuntime table, CheckpointBarrier barrier, SqlConnection conn, CancellationToken ct)
     {
         var waited = TimeSpan.Zero;
         while (true)
@@ -811,6 +909,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             catch (TimeoutException)
             {
                 waited += CheckpointWarningInterval;
+                await ReleaseConnectionWhileBlockedAsync(table, conn);
                 _logger.LogWarning(
                     "Capture instance {CaptureInstance}: still waiting after {Waited} for the current batch to be " +
                     "acknowledged. The watermark cannot advance and polling is paused for this table. Is every " +
@@ -818,6 +917,27 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     table.CaptureInstance, waited);
             }
         }
+    }
+
+    /// <summary>
+    /// Gives the poll connection back to the pool while delivery is stalled on a slow or dead
+    /// consumer. The stall can last hours, and a connection pinned for that long is one fewer for
+    /// the rest of the application and a target for idle-timeout kills. Only called once a wait
+    /// has already exceeded <see cref="CheckpointWarningInterval"/>, so the fast path — the usual
+    /// batch, delivered in milliseconds — never pays a close and reopen.
+    /// </summary>
+    private async Task ReleaseConnectionWhileBlockedAsync(TableRuntime table, SqlConnection conn)
+    {
+        if (conn.State != ConnectionState.Open)
+        {
+            return;
+        }
+
+        await conn.CloseAsync();
+        _logger.LogDebug(
+            "Capture instance {CaptureInstance}: delivery is stalled, the poll connection was released " +
+            "until the batch is through.",
+            table.CaptureInstance);
     }
 
     /// <summary>
@@ -857,10 +977,13 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     }
 
     /// <summary>
-    /// Runs the change function over a range in an explicit order, so a cap always falls on a
-    /// well-defined row, rows of one transaction stay contiguous and an update's before-image
-    /// precedes its after-image. The function does not expose <c>__$command_id</c>, so the order is
-    /// the one its documentation states: start LSN, sequence value, operation.
+    /// Runs the change function over a range ordered by start LSN, which keeps the rows of one
+    /// transaction contiguous so the cap always falls on a transaction boundary the builder can
+    /// recognise. That is the leading column of the change table's clustered index, so the plan
+    /// streams the first rows in index order instead of sorting the whole range on every poll:
+    /// the function does not expose <c>__$command_id</c>, and ordering on the remaining columns
+    /// would force exactly that sort. The order of rows inside a transaction is therefore not
+    /// relied upon; <see cref="CdcChangePairer"/> pairs update images whichever comes first.
     /// <paramref name="batchSize"/> <c>null</c> reads the range in full.
     /// </summary>
     private async Task<ChangeBatch> QueryChangesAsync(
@@ -873,7 +996,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         var top = batchSize is { } size ? "TOP (@top) " : string.Empty;
         await using var cmd = new SqlCommand(
             $"SELECT {top}* FROM {functionName}(@from, @to, N'all update old') " +
-            "ORDER BY __$start_lsn, __$seqval, __$operation;", conn);
+            "ORDER BY __$start_lsn;", conn);
         cmd.CommandTimeout = CommandTimeoutSeconds;
         cmd.Parameters.Add("@from", SqlDbType.Binary, 10).Value = fromLsn;
         cmd.Parameters.Add("@to", SqlDbType.Binary, 10).Value = toLsn;

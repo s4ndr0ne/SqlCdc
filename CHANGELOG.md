@@ -6,38 +6,100 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-### Added
-
-- `WithLeaseKeepaliveInterval` (`LeaseKeepaliveInterval` in configuration): how often the active
-  instance verifies it still holds the lease. Defaults to 10 seconds; previously the lease was
-  checked on every polling cycle, which with a short poll interval dominated the traffic on the
-  lease connection.
-- `sqlcdc.skipped.rows`: counts CDC rows whose `__$operation` value is not supported, which are
-  skipped rather than delivered — see Delivery semantics.
+This release changes the defaults towards not losing data. Every one of them can be set back to
+the previous behaviour explicitly; see **Migrating** below.
 
 ### Changed
 
+- **The watermark is persisted in SQL Server by default.** A watcher built without `UseStateStore`
+  now uses a `SqlCdcStateStore` on the watched database (table `dbo.cdc_watermark`, created on
+  first use) instead of `InMemoryCdcStateStore`, so a restart resumes where it left off rather
+  than skipping everything that happened in between under `FromNow`. The store shares the
+  watcher's connection factory, so it authenticates the same way and saves on the poll connection.
+  The account therefore needs `CREATE TABLE` rights on first use, or the table provisioned by
+  `scripts/create-state-tables.sql` and `createTableIfMissing: false`.
+- **`OnAcknowledgement` is the default checkpoint mode.** The watermark only moves past a batch
+  once every change in it has been acknowledged. Handlers registered with `AddCdcChangeHandler`
+  are acknowledged automatically; code that reads `watcher.Changes` directly must call
+  `CdcChange.Acknowledge()` on every change, or polling stalls at the first batch (reported every
+  30 seconds).
+- **Leader election is on by default**, on a lease named after the watcher (`WithName`, `default`
+  unless set). Replicas of one application share the name and elect a single active instance;
+  watchers with different names never contend. `UseSingleActiveInstance` now takes an optional
+  lease name (previously it defaulted to `SqlCdc`) to share a lease across differently named
+  watchers, and the new `WithoutSingleActiveInstance` (`"SingleActiveInstance": false` in
+  configuration) turns election off for a deployment with exactly one instance.
+- **A dead-letter sink is required as soon as a handler is registered.** A handler that has used
+  up its attempts has its change acknowledged, so without a sink the change was simply dropped.
+  The host now fails to start with a message naming `AddCdcDeadLetterSink`.
+- **A dead-letter sink that fails is retried** with the handler backoff (capped at one minute)
+  until the write succeeds, instead of logging and dropping the dead letter. Delivery pauses
+  meanwhile; under `OnAcknowledgement` the change also stays unacknowledged, so a restart replays
+  it. The first failure is logged as an error, the retries as warnings.
+- **Unsupported CDC rows fail the poll instead of being skipped.** A row with an `__$operation`
+  value outside 1–4, or an update image without its counterpart, now throws: the poll of that
+  capture instance fails and is retried with backoff, the watermark does not move past the row,
+  `sqlcdc.poll.failures` counts it and the health check turns unhealthy. The other capture
+  instances keep polling. `SqlCdcDiagnostics.SkippedRowsMetric` is obsolete and no longer emitted.
+- **The token passed to `StartAsync` no longer stops the watcher.** It bounds the startup work
+  only; the polling loop runs until `StopAsync` or `DisposeAsync`. A caller's startup timeout can
+  therefore no longer stop a healthy watcher minutes later.
+- The change function is read with `TOP (BatchSize + 1)` ordered by `__$start_lsn`, the leading
+  column of the change table's clustered index, so each poll streams one batch in index order.
+  Update images are paired whichever comes first, so the order inside a transaction is not
+  relied upon.
+- While delivery is stalled on a slow or dead consumer for more than 30 seconds, the poll
+  connection is given back to the pool and taken again for the checkpoint, so a stall that lasts
+  hours does not pin a connection. The usual batch never pays the round-trip.
+- The lease is verified between tables and between batches as well as at the top of the polling
+  cycle (still throttled by `WithLeaseKeepaliveInterval`), so a wait on a slow consumer that
+  outlasts the interval is followed by a real check before the next batch is read, rather than by
+  more batches from an instance that may no longer be the leader.
+- The lease provider clears the connection pool whenever it drops its connection, so a custom
+  connection factory handing out pooled connections cannot leave the session lock in an idle pool.
 - Polling a capture instance now uses a single connection for the whole cycle — log bounds,
   changes and commit-time mapping — instead of opening one per round-trip.
 - The delay after a polling error now doubles with each consecutive failure, capped at 5 minutes,
   instead of staying fixed at `WithRetryDelay`. The configured value is the initial delay, and a
   successful poll resets the backoff.
 
+### Migrating
+
+- No persistent watermark wanted (tests, deliberately ephemeral consumers):
+  `UseStateStore(new InMemoryCdcStateStore())`.
+- No DDL rights at runtime: run `scripts/create-state-tables.sql` and pass
+  `UseStateStore(new SqlCdcStateStore(connectionString, createTableIfMissing: false))`.
+- Previous checkpoint behaviour: `WithCheckpointMode(CdcCheckpointMode.OnEmit)`.
+- Exactly one instance and no lease connection wanted: `WithoutSingleActiveInstance()`.
+- Several watchers that previously shared the implicit `SqlCdc` lease: `UseSingleActiveInstance("SqlCdc")`.
+- Handlers without a sink: `AddCdcDeadLetterSink(new SqlCdcDeadLetterSink(connectionString))`.
+
+### Added
+
+- `CdcWatcherStatus.ConsecutiveLeaseFailures` and `StandbySince`, the `sqlcdc.lease.failures`
+  counter, and `SqlCdcHealthCheckOptions.MaxStandbyDuration`. A standby whose lease attempts throw
+  is now reported degraded, then unhealthy after `UnhealthyAfterConsecutiveFailures`, instead of
+  hiding behind the "standing by is healthy" rule; a standby that lasts longer than
+  `MaxStandbyDuration` (opt-in) is reported degraded.
+- `WithLeaseKeepaliveInterval` (`LeaseKeepaliveInterval` in configuration): how often the active
+  instance verifies it still holds the lease. Defaults to 10 seconds; previously the lease was
+  checked on every polling cycle, which with a short poll interval dominated the traffic on the
+  lease connection.
+- `WithoutSingleActiveInstance` on the builder, and `false` for `SingleActiveInstance` in
+  configuration, to run without leader election.
+
 ### Fixed
 
 - Catching up on a large backlog cost time quadratic in its size: the batch cap stopped reading
   after `WithBatchSize` rows, but the query still returned the whole remaining range and the
-  client drained it on every poll. The change function is now queried with `TOP (BatchSize + 1)`
-  in the change table's clustered order, so each poll transfers one batch. A single transaction
-  larger than the batch size is still read in full, in a second query bounded to its own LSN.
+  client drained it on every poll. Each poll now transfers one batch (see Changed). A single
+  transaction larger than the batch size is still read in full, in a second query bounded to its
+  own LSN.
 - With a `SqlCdcStateStore` pointed at a different database (or credentials) than the watched
   one, watermarks were read through the store's connection but written on the poll connection —
   into the wrong database — and never found again after a restart. The poll connection is now
   reused only when the store targets the same connection string and token callback, or the very
   same connection factory instance; otherwise the store opens its own connection per save.
-- CDC rows with an unsupported `__$operation` value were dropped silently while the watermark
-  still advanced past them. They are now counted in `sqlcdc.skipped.rows` and reported with a
-  warning (one per operation value), so the loss is visible in logs and metrics.
 - A watcher that acquired the lease but could not load its watermarks — the state store being
   unavailable, for instance — kept the lock and blocked every standby. It now releases the lease
   and retries from the standby position, so another instance can take over.
@@ -50,7 +112,8 @@ All notable changes to this project are documented here. The format follows
   reason.
 - After such a crash the hosted service ended silently and the host kept running with CDC dead.
   It now restarts the watcher (after `WithRetryDelay`, with the usual backoff on repeated start
-  failures); a deliberate `StopAsync` by the application still leaves the watcher stopped.
+  failures), whether or not handlers are registered; a deliberate `StopAsync` by the application
+  still leaves the watcher stopped.
 - A table with no changes for longer than the CDC retention period (3 days by default) triggered
   the "changes … were removed by the CDC cleanup job and are lost" warning even though no change
   ever existed: its watermark never moved, so the cleanup job eventually trimmed past it. An empty
@@ -70,12 +133,9 @@ All notable changes to this project are documented here. The format follows
   both sides named.
 - If `sp_releaseapplock` fails on a pooled lease connection (custom connection factories may hand
   those out), the connection went back to the pool still holding the session lock, delaying
-  failover until the pool reused it. The pool is now cleared so disposing truly ends the session,
-  and a custom factory is reminded at construction that the lease connection should be unpooled.
+  failover until the pool reused it. The pool is now cleared so disposing truly ends the session.
 - The static metrics registry pinned undisposed watchers forever (and kept reporting their
   gauges). It now holds them weakly: a collected watcher drops out of the metrics on its own.
-- An update before-image (`__$operation` = 3) without its after-image was dropped silently; it is
-  now counted in `sqlcdc.skipped.rows` and reported with a warning, like unknown operations.
 - Concurrent first use across processes could fail transiently on `CREATE TABLE` (error 2714)
   inside the ensure step itself; it is now treated as "the table exists", which is all the ensure
   has to guarantee.

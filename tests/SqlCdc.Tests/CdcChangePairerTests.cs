@@ -77,6 +77,24 @@ public class CdcChangePairerTests
     }
 
     [Fact]
+    public void AfterImageArrivingFirst_IsPairedWithItsBeforeImage()
+    {
+        // The query orders rows by start LSN only, so the order inside a transaction is not
+        // guaranteed: pairing must not depend on the before-image coming first.
+        var before = Row(3, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 9.99m)));
+        var after = Row(4, seqVal: before.SeqVal, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 12.50m)),
+            mask: new byte[] { 0b0000_0100 });
+
+        var change = Assert.Single(Pair(after, before));
+
+        Assert.Equal(CdcOperationType.Update, change.Operation);
+        Assert.Equal(9.99m, change.Before["Price"]);
+        Assert.Equal(12.50m, change.After["Price"]);
+        Assert.True(change.UpdateMask["Price"]);
+        Assert.Equal(after.SeqVal, change.SeqVal);
+    }
+
+    [Fact]
     public void Key_IsStableForSameLsnAndSeqVal()
     {
         var row = Row(2, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 9.99m)));

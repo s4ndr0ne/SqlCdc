@@ -90,11 +90,14 @@ namespace SqlCdc
     {
         public CdcWatcherStatus(string Name, bool IsRunning, bool IsLeader, int ChannelLength, System.Collections.Generic.IReadOnlyList<SqlCdc.CdcTableStatus> Tables) { }
         public int ChannelLength { get; init; }
+        public int ConsecutiveLeaseFailures { get; init; }
         public bool IsLeader { get; init; }
         public bool IsRunning { get; init; }
         public int MaxConsecutiveFailures { get; }
         public string Name { get; init; }
+        public System.DateTimeOffset? StandbySince { get; init; }
         public System.Collections.Generic.IReadOnlyList<SqlCdc.CdcTableStatus> Tables { get; init; }
+        public System.TimeSpan? TimeInStandby { get; }
     }
     public interface ICdcChangeHandler
     {
@@ -180,9 +183,12 @@ namespace SqlCdc
         public const string HandlerDurationMetric = "sqlcdc.handler.duration";
         public const string HandlerFailuresMetric = "sqlcdc.handler.failures";
         public const string LeaderMetric = "sqlcdc.leader";
+        public const string LeaseFailuresMetric = "sqlcdc.lease.failures";
         public const string MeterName = "SqlCdc";
         public const string PollDurationMetric = "sqlcdc.poll.duration";
         public const string PollFailuresMetric = "sqlcdc.poll.failures";
+        [System.Obsolete("No longer emitted: unsupported rows fail the poll and count in sqlcdc.poll.failur" +
+            "es.")]
         public const string SkippedRowsMetric = "sqlcdc.skipped.rows";
     }
     public sealed class SqlCdcHealthCheck : Microsoft.Extensions.Diagnostics.HealthChecks.IHealthCheck
@@ -193,6 +199,7 @@ namespace SqlCdc
     public sealed class SqlCdcHealthCheckOptions
     {
         public SqlCdcHealthCheckOptions() { }
+        public System.TimeSpan? MaxStandbyDuration { get; set; }
         public System.TimeSpan? MaxTimeSinceLastPoll { get; set; }
         public int UnhealthyAfterConsecutiveFailures { get; set; }
     }
@@ -225,7 +232,7 @@ namespace SqlCdc
         public SqlCdc.SqlCdcWatcherBuilder UseConnectionString(string connectionString) { }
         public SqlCdc.SqlCdcWatcherBuilder UseLeaseProvider(SqlCdc.ICdcLeaseProvider leaseProvider) { }
         public SqlCdc.SqlCdcWatcherBuilder UseLogger(Microsoft.Extensions.Logging.ILogger logger) { }
-        public SqlCdc.SqlCdcWatcherBuilder UseSingleActiveInstance(string leaseName = "SqlCdc") { }
+        public SqlCdc.SqlCdcWatcherBuilder UseSingleActiveInstance(string? leaseName = null) { }
         public SqlCdc.SqlCdcWatcherBuilder UseStateStore(SqlCdc.ICdcStateStore stateStore) { }
         public SqlCdc.SqlCdcWatcherBuilder WatchTable(string schema, string table, string? captureInstance = null) { }
         public SqlCdc.SqlCdcWatcherBuilder WatchTables([System.Runtime.CompilerServices.TupleElementNames(new string[] {
@@ -241,6 +248,7 @@ namespace SqlCdc
         public SqlCdc.SqlCdcWatcherBuilder WithName(string name) { }
         public SqlCdc.SqlCdcWatcherBuilder WithPollInterval(System.TimeSpan pollInterval) { }
         public SqlCdc.SqlCdcWatcherBuilder WithRetryDelay(System.TimeSpan retryDelay) { }
+        public SqlCdc.SqlCdcWatcherBuilder WithoutSingleActiveInstance() { }
         public static SqlCdc.SqlCdcWatcherBuilder Create() { }
     }
 }

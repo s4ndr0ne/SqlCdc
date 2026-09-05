@@ -101,11 +101,12 @@ public static class SqlCdcServiceCollectionExtensions
             var boundConfiguration = configuration?.Get<SqlCdcConfiguration>();
             if (boundConfiguration is not null)
             {
-                // The section turning on the built-in election would silently discard the custom
-                // provider registered above. That contradiction is a configuration mistake, and it
-                // fails startup with both sides named rather than running with the wrong one.
+                // The section deciding about election — turning the built-in one on, naming its
+                // lease, or turning election off — would silently discard the custom provider
+                // registered above. That contradiction is a configuration mistake, and it fails
+                // startup with both sides named rather than running with the wrong one.
                 if (leaseProvider is not null &&
-                    (boundConfiguration.SingleActiveInstance == true ||
+                    (boundConfiguration.SingleActiveInstance is not null ||
                      !string.IsNullOrWhiteSpace(boundConfiguration.LeaseName)))
                 {
                     throw new InvalidOperationException(

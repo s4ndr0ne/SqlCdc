@@ -10,34 +10,45 @@ Console.CancelKeyPress += (_, e) =>
     cts.Cancel();
 };
 
-var watcher = SqlCdcWatcherBuilder
+// Disposing stops the poll, completes the channel and releases the lease. The token passed to
+// StartAsync only bounds the startup work, so it is the dispose that stops the watcher on Ctrl+C.
+await using var watcher = SqlCdcWatcherBuilder
     .Create()
     .UseConnectionString(connectionString)
     .WatchTable("dbo", "Orders")
     .WatchTable("dbo", "Customers")
     .WithPollInterval(TimeSpan.FromMilliseconds(250))
-    .UseStateStore(new SqlCdcStateStore(connectionString))
     .Build();
 
 await watcher.StartAsync(cts.Token);
-Console.WriteLine($"Watching {watcher.Channel.Reader.CanCount} tables. Press Ctrl+C to stop.");
+Console.WriteLine("Watching dbo.Orders and dbo.Customers. Press Ctrl+C to stop.");
 
-await foreach (var change in watcher.Changes.WithCancellation(cts.Token))
+try
 {
-    Console.WriteLine($"[{change.CommitTime:O}] {change.TableName} {change.Operation}");
-    foreach (var (column, value) in change.After)
+    await foreach (var change in watcher.Changes.WithCancellation(cts.Token))
     {
-        if (change.UpdateMask.TryGetValue(column, out var updated) && updated)
+        Console.WriteLine($"[{change.CommitTime:O}] {change.TableName} {change.Operation}");
+        foreach (var (column, value) in change.After)
         {
-            Console.WriteLine($"    ~ {column} = {value ?? "NULL"}");
+            if (change.UpdateMask.TryGetValue(column, out var updated) && updated)
+            {
+                Console.WriteLine($"    ~ {column} = {value ?? "NULL"}");
+            }
+            else
+            {
+                Console.WriteLine($"      {column} = {value ?? "NULL"}");
+            }
         }
-        else
-        {
-            Console.WriteLine($"      {column} = {value ?? "NULL"}");
-        }
-    }
 
-    change.Acknowledge();
+        // The default checkpoint mode is OnAcknowledgement: the watermark only moves past a batch
+        // once every change in it has been acknowledged.
+        change.Acknowledge();
+    }
+}
+catch (OperationCanceledException) when (cts.IsCancellationRequested)
+{
+    // Ctrl+C.
 }
 
+await watcher.StopAsync();
 Console.WriteLine("Stopped.");

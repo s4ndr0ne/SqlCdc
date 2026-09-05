@@ -29,7 +29,20 @@ internal sealed class SqlCdcHostedService : BackgroundService
         _scopeFactory = scopeFactory;
         _logger = logger;
         _deadLetterSink = deadLetterSink;
+
+        // Checked here rather than in ExecuteAsync so the host fails to start with this exception
+        // in hand, instead of starting and then stopping itself from a background failure.
+        _hasHandlers = HasHandlers();
+        if (_hasHandlers && _deadLetterSink is null)
+        {
+            throw new InvalidOperationException(
+                "CDC handlers are registered but no ICdcDeadLetterSink is configured. A handler that fails has " +
+                "its change acknowledged and the watermark moves past it, so without a sink the change is lost. " +
+                "Register one with AddCdcDeadLetterSink(...), for example new SqlCdcDeadLetterSink(connectionString).");
+        }
     }
+
+    private readonly bool _hasHandlers;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -37,20 +50,12 @@ internal sealed class SqlCdcHostedService : BackgroundService
         // path, so a database that is briefly unavailable delays CDC instead of failing the host.
         await Task.Yield();
 
-        var hasHandlers = HasHandlers();
-        if (hasHandlers && _deadLetterSink is null)
-        {
-            throw new InvalidOperationException(
-                "CDC handlers are registered but no ICdcDeadLetterSink is configured. Register a durable " +
-                "dead-letter sink with AddCdcDeadLetterSink(...) before starting the host.");
-        }
-
         if (!await StartWatcherAsync(stoppingToken))
         {
             return;
         }
 
-        if (!hasHandlers)
+        if (!_hasHandlers)
         {
             // No handlers registered: the application reads SqlCdcWatcher.Changes itself.
             _logger.LogInformation("No CDC handlers are registered; leaving channel consumption to the application.");
@@ -63,15 +68,6 @@ internal sealed class SqlCdcHostedService : BackgroundService
                     CdcCheckpointMode.OnAcknowledgement);
             }
 
-            try
-            {
-                await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-            }
-
-            return;
         }
 
         while (!stoppingToken.IsCancellationRequested)
@@ -79,9 +75,19 @@ internal sealed class SqlCdcHostedService : BackgroundService
             try
             {
                 // Re-evaluated on every iteration: a restarted watcher delivers on a new channel.
-                await foreach (var change in _watcher.Changes.WithCancellation(stoppingToken))
+                if (_hasHandlers)
                 {
-                    await DispatchAsync(change, stoppingToken);
+                    await foreach (var change in _watcher.Changes.WithCancellation(stoppingToken))
+                    {
+                        await DispatchAsync(change, stoppingToken);
+                    }
+                }
+                else
+                {
+                    // The application reads the channel; this service only watches for it to end,
+                    // so a crash is restarted here too rather than leaving CDC dead behind a
+                    // consumer that merely sees its enumeration complete.
+                    await _watcher.Channel.Reader.Completion.WaitAsync(stoppingToken);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -275,10 +281,15 @@ internal sealed class SqlCdcHostedService : BackgroundService
             catch (Exception ex)
             {
                 var delay = BackoffFor(attempt);
-                _logger.LogError(
+
+                // The first failure is the event worth alerting on; the retries that follow, one
+                // a minute at most, would otherwise flood the error log while the sink is down.
+                _logger.Log(
+                    attempt == 1 ? LogLevel.Error : LogLevel.Warning,
                     ex,
-                    "The dead-letter sink failed for change {ChangeKey} on {TableName} " +
-                    "(attempt {Attempt}); the change remains unacknowledged and will be retried in {RetryDelay}",
+                    "The dead-letter sink failed for change {ChangeKey} on {TableName} (attempt {Attempt}); " +
+                    "delivery is paused and the write is retried in {RetryDelay}. In OnAcknowledgement mode the " +
+                    "change stays unacknowledged, so a restart replays it; in OnEmit mode it is lost on restart.",
                     deadLetter.Change.Key, deadLetter.Change.TableName, attempt, delay);
 
                 await Task.Delay(delay, ct);

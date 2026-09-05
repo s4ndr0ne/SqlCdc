@@ -38,11 +38,51 @@ public class BuilderTests
             .WatchTable("dbo", "Orders")
             .Build();
 
-        var stateStore = typeof(SqlCdcWatcher)
-            .GetField("_stateStore", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
-            ?.GetValue(watcher);
+        Assert.IsType<SqlCdcStateStore>(watcher.StateStore);
+    }
 
-        Assert.IsType<SqlCdcStateStore>(stateStore);
+    [Fact]
+    public void Build_ByDefault_ElectsALeader_OnALeaseNamedAfterTheWatcher()
+    {
+        // Two watchers with different names on the same database must never contend for the same
+        // lease, or one of them would stand by forever while looking healthy.
+        var watcher = SqlCdcWatcherBuilder
+            .Create()
+            .UseConnectionString("Server=.;Database=x")
+            .WatchTable("dbo", "Orders")
+            .WithName("sales")
+            .Build();
+
+        var lease = Assert.IsType<SqlApplicationLockLeaseProvider>(watcher.LeaseProvider);
+        Assert.Equal("SqlCdc:sales", lease.ResourceName);
+    }
+
+    [Fact]
+    public void UseSingleActiveInstance_WithAName_UsesThatLease_WhateverTheWatcherIsCalled()
+    {
+        var watcher = SqlCdcWatcherBuilder
+            .Create()
+            .UseConnectionString("Server=.;Database=x")
+            .WatchTable("dbo", "Orders")
+            .WithName("sales")
+            .UseSingleActiveInstance("shared")
+            .Build();
+
+        var lease = Assert.IsType<SqlApplicationLockLeaseProvider>(watcher.LeaseProvider);
+        Assert.Equal("SqlCdc:shared", lease.ResourceName);
+    }
+
+    [Fact]
+    public void WithoutSingleActiveInstance_RunsWithoutALease()
+    {
+        var watcher = SqlCdcWatcherBuilder
+            .Create()
+            .UseConnectionString("Server=.;Database=x")
+            .WatchTable("dbo", "Orders")
+            .WithoutSingleActiveInstance()
+            .Build();
+
+        Assert.IsType<NullCdcLeaseProvider>(watcher.LeaseProvider);
     }
 
     [Theory]

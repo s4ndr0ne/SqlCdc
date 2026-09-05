@@ -43,4 +43,17 @@ public sealed record CdcWatcherStatus(
 {
     /// <summary>Highest number of consecutive failures across the watched capture instances.</summary>
     public int MaxConsecutiveFailures => Tables.Count == 0 ? 0 : Tables.Max(t => t.ConsecutiveFailures);
+
+    /// <summary>
+    /// Attempts to acquire or verify the lease that failed with an error, in a row; zero once one
+    /// succeeds. "Another instance holds the lease" is the normal state of a standby and does not
+    /// count. Non-zero on a standby means it could not even ask.
+    /// </summary>
+    public int ConsecutiveLeaseFailures { get; init; }
+
+    /// <summary>When this instance last became a standby, or <c>null</c> while it is the leader.</summary>
+    public DateTimeOffset? StandbySince { get; init; }
+
+    /// <summary>How long this instance has been standing by, or <c>null</c> while it is the leader.</summary>
+    public TimeSpan? TimeInStandby => StandbySince is null ? null : DateTimeOffset.UtcNow - StandbySince.Value;
 }

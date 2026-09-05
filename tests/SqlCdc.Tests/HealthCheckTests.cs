@@ -24,6 +24,41 @@ public class HealthCheckTests
     }
 
     [Fact]
+    public async Task AStandbyThatCannotReachTheLease_IsDegraded_ThenUnhealthy()
+    {
+        // A standby waiting its turn is healthy; one whose lease attempts throw — database down,
+        // application lock denied — is failing exactly like a capture instance whose polls fail,
+        // and must not hide behind the standby exemption.
+        var degraded = await CheckAsync(Status(running: true, leader: false) with { ConsecutiveLeaseFailures = 1 });
+        Assert.Equal(HealthStatus.Degraded, degraded.Status);
+        Assert.Contains("lease", degraded.Description);
+
+        var unhealthy = await CheckAsync(
+            Status(running: true, leader: false) with { ConsecutiveLeaseFailures = 3 },
+            new SqlCdcHealthCheckOptions { UnhealthyAfterConsecutiveFailures = 3 });
+        Assert.Equal(HealthStatus.Unhealthy, unhealthy.Status);
+        Assert.Contains("lease", unhealthy.Description);
+    }
+
+    [Fact]
+    public async Task ALongStandby_IsDegraded_OnlyWhenAThresholdIsSet()
+    {
+        var standby = Status(running: true, leader: false) with
+        {
+            StandbySince = DateTimeOffset.UtcNow - TimeSpan.FromHours(2),
+        };
+
+        Assert.Equal(HealthStatus.Healthy, (await CheckAsync(standby)).Status);
+
+        var result = await CheckAsync(
+            standby,
+            new SqlCdcHealthCheckOptions { MaxStandbyDuration = TimeSpan.FromHours(1) });
+
+        Assert.Equal(HealthStatus.Degraded, result.Status);
+        Assert.Contains("Standing by for", result.Description);
+    }
+
+    [Fact]
     public async Task Polling_IsHealthy()
     {
         var result = await CheckAsync(Status(running: true, leader: true, Table("dbo_Orders")));
@@ -76,6 +111,7 @@ public class HealthCheckTests
 
         Assert.Equal("orders", result.Data["watcher"]);
         Assert.Equal(true, result.Data["isLeader"]);
+        Assert.Equal(0, result.Data["consecutiveLeaseFailures"]);
         var table = Assert.IsType<Dictionary<string, object?>>(result.Data["dbo_Orders"]);
         Assert.Equal(7L, table["changesEmitted"]);
     }

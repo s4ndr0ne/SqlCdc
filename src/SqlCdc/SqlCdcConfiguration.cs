@@ -48,12 +48,15 @@ public sealed class SqlCdcConfiguration
     public TimeSpan? LeaseKeepaliveInterval { get; set; }
 
     /// <summary>
-    /// Elects a single active watcher across replicas. Also turned on by setting
-    /// <see cref="LeaseName"/> alone.
+    /// Elects a single active watcher across replicas. On by default; set to <c>false</c> to run
+    /// without leader election in a deployment that has exactly one instance.
     /// </summary>
     public bool? SingleActiveInstance { get; set; }
 
-    /// <summary>Lease name shared by the instances that elect a leader between them.</summary>
+    /// <summary>
+    /// Lease name shared by the instances that elect a leader between them. Defaults to the
+    /// watcher's <see cref="Name"/>.
+    /// </summary>
     public string? LeaseName { get; set; }
 
     /// <summary>Attempts per handler before a change is dead-lettered.</summary>
@@ -137,12 +140,13 @@ public sealed class SqlCdcConfiguration
             builder.WithLeaseKeepaliveInterval(leaseKeepaliveInterval);
         }
 
-        if (SingleActiveInstance == true || !string.IsNullOrWhiteSpace(LeaseName))
+        if (SingleActiveInstance == false)
         {
-            builder.UseSingleActiveInstance(
-                string.IsNullOrWhiteSpace(LeaseName)
-                    ? SqlApplicationLockLeaseProvider.DefaultLeaseName
-                    : LeaseName);
+            builder.WithoutSingleActiveInstance();
+        }
+        else if (SingleActiveInstance == true || !string.IsNullOrWhiteSpace(LeaseName))
+        {
+            builder.UseSingleActiveInstance(string.IsNullOrWhiteSpace(LeaseName) ? null : LeaseName);
         }
 
         if (MaxHandlerAttempts is { } maxHandlerAttempts)

@@ -22,9 +22,12 @@ public sealed class SqlCdcWatcherBuilder
     private TimeSpan _leaseRetryDelay = TimeSpan.FromSeconds(10);
     private TimeSpan _leaseKeepaliveInterval = TimeSpan.FromSeconds(10);
     private ICdcLeaseProvider? _leaseProvider;
-    // Replicas must never deliver the same CDC stream concurrently. Call
-    // UseSingleActiveInstance with a distinct name for an independent watcher.
-    private string? _singleActiveInstanceLeaseName = SqlApplicationLockLeaseProvider.DefaultLeaseName;
+
+    // Replicas must never deliver the same CDC stream concurrently, so leader election is on
+    // unless the application opts out. The lease is named after the watcher (see Build) so two
+    // watchers with different names on the same database do not contend by accident.
+    private bool _singleActiveInstance = true;
+    private string? _leaseName;
     private ICdcConnectionFactory? _connectionFactory;
     private Func<SqlAuthenticationParameters, CancellationToken, Task<SqlAuthenticationToken>>? _accessTokenCallback;
     private string _name = "default";
@@ -144,20 +147,38 @@ public sealed class SqlCdcWatcherBuilder
 
     /// <summary>
     /// Makes only one instance poll at a time, electing a leader through a SQL Server application
-    /// lock on the watched database. This is enabled by default; use a distinct name for an
-    /// independent watcher against the same database.
+    /// lock on the watched database. This is on by default, so calling it is only needed to
+    /// choose the lease name or to turn election back on after <see cref="UseLeaseProvider"/>
+    /// or <see cref="WithoutSingleActiveInstance"/>.
     /// </summary>
     /// <param name="leaseName">
-    /// Name shared by the instances that elect a leader between them. Use distinct names to run
-    /// independent watchers (different table sets) against the same database.
+    /// Name shared by the instances that elect a leader between them. Defaults to the watcher's
+    /// <see cref="WithName">name</see>, so watchers with different names never contend. Give
+    /// replicas of the same application the same watcher name, or the same lease name here.
     /// </param>
-    public SqlCdcWatcherBuilder UseSingleActiveInstance(
-        string leaseName = SqlApplicationLockLeaseProvider.DefaultLeaseName)
+    public SqlCdcWatcherBuilder UseSingleActiveInstance(string? leaseName = null)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(leaseName);
+        if (leaseName is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(leaseName);
+        }
 
-        // Built in Build(), where the connection string is known regardless of call order.
-        _singleActiveInstanceLeaseName = leaseName;
+        // Built in Build(), where the connection string and the name are known regardless of call order.
+        _singleActiveInstance = true;
+        _leaseName = leaseName;
+        _leaseProvider = null;
+        return this;
+    }
+
+    /// <summary>
+    /// Runs without leader election. Only safe when exactly one instance of the application polls
+    /// this watcher's tables: a second instance would deliver every change again and fight over
+    /// the watermark. Saves the dedicated lease connection a single-instance deployment does not need.
+    /// </summary>
+    public SqlCdcWatcherBuilder WithoutSingleActiveInstance()
+    {
+        _singleActiveInstance = false;
+        _leaseName = null;
         _leaseProvider = null;
         return this;
     }
@@ -171,7 +192,8 @@ public sealed class SqlCdcWatcherBuilder
         ArgumentNullException.ThrowIfNull(leaseProvider);
 
         _leaseProvider = leaseProvider;
-        _singleActiveInstanceLeaseName = null;
+        _singleActiveInstance = false;
+        _leaseName = null;
         return this;
     }
 
@@ -325,10 +347,9 @@ public sealed class SqlCdcWatcherBuilder
 
         var leaseProvider = _leaseProvider;
         var ownsLeaseProvider = false;
-        if (_singleActiveInstanceLeaseName is not null)
+        if (leaseProvider is null && _singleActiveInstance)
         {
-            leaseProvider = new SqlApplicationLockLeaseProvider(
-                connections, _singleActiveInstanceLeaseName, _logger);
+            leaseProvider = new SqlApplicationLockLeaseProvider(connections, _leaseName ?? _name, _logger);
             ownsLeaseProvider = true;
         }
 

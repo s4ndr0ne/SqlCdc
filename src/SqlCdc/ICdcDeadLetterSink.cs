@@ -21,8 +21,10 @@ public sealed record CdcDeadLetter(
 /// </summary>
 /// <remarks>
 /// The sink is on the delivery path: it is awaited before the next change is dispatched. A sink
-/// that throws is retried and keeps the change unacknowledged, so an unavailable sink applies
-/// backpressure rather than losing the dead letter. Keep the write cheap.
+/// that throws is retried with backoff until it accepts the write, so an unavailable sink pauses
+/// delivery rather than losing the dead letter. In <see cref="CdcCheckpointMode.OnAcknowledgement"/>
+/// the change also stays unacknowledged, so a restart during the outage replays it. Keep the
+/// write cheap.
 /// </remarks>
 public interface ICdcDeadLetterSink
 {

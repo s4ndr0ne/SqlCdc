@@ -349,7 +349,7 @@ public sealed class SqlCdcWatcherBuilder
         var ownsLeaseProvider = false;
         if (leaseProvider is null && _singleActiveInstance)
         {
-            leaseProvider = new SqlApplicationLockLeaseProvider(connections, _leaseName ?? _name, _logger);
+            leaseProvider = new SqlApplicationLockLeaseProvider(connections, _leaseName ?? _name, _logger, _commandTimeout);
             ownsLeaseProvider = true;
         }
 

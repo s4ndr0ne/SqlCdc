@@ -27,6 +27,7 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
     private readonly string _resource;
     private readonly ILogger _logger;
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly int _commandTimeoutSeconds;
     private SqlConnection? _connection;
     private bool _disposed;
 
@@ -56,6 +57,20 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
         ICdcConnectionFactory connections,
         string leaseName = DefaultLeaseName,
         ILogger? logger = null)
+        : this(connections, leaseName, logger, commandTimeout: null)
+    {
+    }
+
+    /// <summary>
+    /// Internal overload so the watcher can share its configured command timeout with the lease's
+    /// own SQL round-trips. <paramref name="commandTimeout"/> is in seconds; <c>null</c> uses a
+    /// default bounded timeout so a hung server cannot stall shutdown forever.
+    /// </summary>
+    internal SqlApplicationLockLeaseProvider(
+        ICdcConnectionFactory connections,
+        string leaseName,
+        ILogger? logger,
+        TimeSpan? commandTimeout)
     {
         ArgumentNullException.ThrowIfNull(connections);
         ArgumentException.ThrowIfNullOrWhiteSpace(leaseName);
@@ -67,6 +82,12 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
                 $"The lease name is too long: the resource name '{_resource}' exceeds {MaxResourceLength} characters.",
                 nameof(leaseName));
         }
+
+        _commandTimeoutSeconds = commandTimeout is { } timeout
+            ? (int)Math.Clamp(Math.Ceiling(timeout.TotalSeconds), 1, int.MaxValue)
+            // No configured timeout: bound it so a DB that stops answering cannot hang a shutdown
+            // through the lease-release round-trip, which StopAsync waits on without a token.
+            : 30;
 
         // Pooling is turned off for this one connection: a pooled connection only releases its
         // session locks when the pool resets it on the next use, which would delay failover after
@@ -100,6 +121,7 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
                 await using var cmd = new SqlCommand("sys.sp_getapplock", connection)
                 {
                     CommandType = CommandType.StoredProcedure,
+                    CommandTimeout = _commandTimeoutSeconds,
                 };
                 cmd.Parameters.AddWithValue("@Resource", _resource);
                 cmd.Parameters.AddWithValue("@LockMode", "Exclusive");
@@ -158,7 +180,10 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
                 // Doubles as a keepalive: a broken connection surfaces here rather than on the
                 // next poll, and APPLOCK_MODE reports what this very session holds.
                 await using var cmd = new SqlCommand(
-                    "SELECT APPLOCK_MODE('public', @resource, 'Session');", _connection);
+                    "SELECT APPLOCK_MODE('public', @resource, 'Session');", _connection)
+                {
+                    CommandTimeout = _commandTimeoutSeconds,
+                };
                 cmd.Parameters.AddWithValue("@resource", _resource);
 
                 var mode = await cmd.ExecuteScalarAsync(cancellationToken) as string;
@@ -248,6 +273,7 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
                 await using var cmd = new SqlCommand("sys.sp_releaseapplock", _connection)
                 {
                     CommandType = CommandType.StoredProcedure,
+                    CommandTimeout = _commandTimeoutSeconds,
                 };
                 cmd.Parameters.AddWithValue("@Resource", _resource);
                 cmd.Parameters.AddWithValue("@LockOwner", "Session");

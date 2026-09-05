@@ -5,6 +5,8 @@
 
 # dotenv files
 .env
+.agents
+docs
 
 # User-specific files
 *.rsuser
@@ -483,3 +485,6 @@ $RECYCLE.BIN/
 
 # Public API approval: the received file is a build output, the approved one is source.
 tests/**/PublicApi.received.txt
+skills-lock.json
+.gitignore
+AGENTS.md

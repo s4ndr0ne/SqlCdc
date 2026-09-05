@@ -48,7 +48,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     private readonly bool _ownsLeaseProvider;
     private readonly ILogger _logger;
     private Channel<CdcChange> _channel;
-    private readonly ConcurrentDictionary<string, TableRuntime> _tables = new();
+    private volatile ConcurrentDictionary<string, TableRuntime> _tables = new();
     private readonly SemaphoreSlim _stateLock = new(1, 1);
     private CancellationTokenSource? _cts;
     private Task? _pollTask;
@@ -56,6 +56,9 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     private volatile bool _crashed;
     private bool _standbyLogged;
     private long _lastLeaseCheckTick;
+
+    /// <summary>Set once the lease has been released, so concurrent release paths run exactly once.</summary>
+    private int _leaseReleased;
 
     /// <summary>
     /// Attempts to acquire or verify the lease that failed with an error, in a row. "Another
@@ -227,24 +230,32 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 _channel = CreateChannel();
             }
 
-            _tables.Clear();
+            // Built into a fresh dictionary and swapped in atomically, so a concurrent GetStatus
+            // never observes the moment where the old tables were cleared before the new ones were
+            // resolved (which would otherwise surface as a transiently empty health snapshot).
+            var resolved = new ConcurrentDictionary<string, TableRuntime>();
             foreach (var subscription in _options.Tables)
             {
                 // Watermarks are not read here: they are loaded once the lease is held, because a
                 // standby instance must not act on a watermark the active one has since advanced.
                 var runtime = await ResolveTableAsync(subscription, cancellationToken);
-                _tables[runtime.CaptureInstance] = runtime;
+                resolved[runtime.CaptureInstance] = runtime;
             }
 
-            if (_tables.Count == 0)
+            if (resolved.Count == 0)
             {
                 throw new InvalidOperationException("No CDC tables were resolved. Is CDC enabled for the configured tables?");
             }
+
+            Interlocked.Exchange(ref _tables, resolved);
 
             _isLeader = false;
             _crashed = false;
             _standbyLogged = false;
             Volatile.Write(ref _leaseFailures, 0);
+            // A fresh start means a release (if any) from the previous run has long since happened;
+            // re-arm the exactly-once guard so this run can release again on StopAsync.
+            Volatile.Write(ref _leaseReleased, 0);
             Volatile.Write(ref _standbySinceTicks, DateTimeOffset.UtcNow.UtcTicks);
 
             // The token passed to StartAsync bounds startup work (capture-instance discovery).
@@ -264,6 +275,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// <summary>Stops the polling loop and completes the channel.</summary>
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {
+        Task? pollTask;
+        CancellationTokenSource? cts;
         try
         {
             await _stateLock.WaitAsync(cancellationToken);
@@ -274,36 +287,47 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         }
         try
         {
-            if (_cts is null)
+            cts = _cts;
+            if (cts is null)
             {
-                return;
+                pollTask = null;
             }
-
-            _cts.Cancel();
-            try
+            else
             {
-                if (_pollTask is not null)
-                {
-                    await _pollTask;
-                }
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            finally
-            {
-                _channel.Writer.TryComplete();
-                _cts.Dispose();
+                cts.Cancel();
+                pollTask = _pollTask;
+                // Detached here so the poll task's own finally — which may block on a slow lease
+                // release — no longer holds up StartAsync/StopAsync/DisposeAsync, which all contend
+                // on _stateLock.
                 _cts = null;
                 _pollTask = null;
             }
-
-            await ReleaseLeaseAsync(cancellationToken);
         }
         finally
         {
             _stateLock.Release();
         }
+
+        // Acknowledged completions and faults are handled below; only the shutdown-relevant ones
+        // are rethrown to the caller through cancellation of the wait itself.
+        if (pollTask is not null)
+        {
+            try
+            {
+                await pollTask;
+            }
+            catch (OperationCanceledException)
+            {
+                // The loop stopped as requested; nothing to surface.
+            }
+        }
+
+        // Disposed only after the poll task has fully exited, so a running loop cannot trip over a
+        // disposed CTS mid-flight.
+        cts?.Dispose();
+        _channel.Writer.TryComplete();
+
+        await ReleaseLeaseAsync(cancellationToken);
     }
 
     public async ValueTask DisposeAsync()
@@ -357,11 +381,15 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
     /// <summary>
     /// Hands the lease back so a standby instance can take over immediately instead of waiting for
-    /// SQL Server to notice the session is gone.
+    /// SQL Server to notice the session is gone. At most one caller actually releases: the poll
+    /// loop's finally and <see cref="StopAsync"/> can both reach here, and a plain <c>_isLeader</c>
+    /// check before stepping down would let them both call <see cref="ICdcLeaseProvider.ReleaseAsync"/>
+    /// concurrently. The exchange makes the release exactly-once; the <c>_isLeader</c> fast path keeps
+    /// a stop before the watcher ever held the lease from releasing one it does not own.
     /// </summary>
     private async Task ReleaseLeaseAsync(CancellationToken cancellationToken)
     {
-        if (!_isLeader)
+        if (!_isLeader || Interlocked.Exchange(ref _leaseReleased, 1) != 0)
         {
             return;
         }
@@ -435,7 +463,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     try
                     {
                         await PollTableAsync(table, ct, activity);
-                        Volatile.Write(ref table.ConsecutiveFailures, 0);
+                        Interlocked.Exchange(ref table.ConsecutiveFailures, 0);
                         table.NextAttemptTick = 0;
                         Volatile.Write(ref table.LastSuccessfulPollTicks, DateTimeOffset.UtcNow.UtcTicks);
                         SqlCdcDiagnostics.PollDuration.Record(
@@ -447,10 +475,12 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     }
                     catch (Exception ex)
                     {
-                        Volatile.Write(ref table.ConsecutiveFailures, table.ConsecutiveFailures + 1);
+                        // Interlocked so a concurrent GetStatus read is never torn, and so two
+                        // concurrent polling paths (not possible today, but safe) cannot lose one.
+                        var failures = Interlocked.Increment(ref table.ConsecutiveFailures);
                         activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
                         SqlCdcDiagnostics.PollFailures.Add(1, TableTags(table));
-                        var retryDelay = RetryDelayFor(table.ConsecutiveFailures);
+                        var retryDelay = RetryDelayFor(failures);
                         var retryMs = retryDelay.TotalMilliseconds;
                         table.NextAttemptTick = retryMs > long.MaxValue - Environment.TickCount64
                             ? long.MaxValue
@@ -459,7 +489,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                             ex,
                             "CDC polling failed for capture instance {CaptureInstance} " +
                             "({ConsecutiveFailures} consecutive failures), retrying in {RetryDelay}",
-                            table.CaptureInstance, table.ConsecutiveFailures, retryDelay);
+                            table.CaptureInstance, failures, retryDelay);
                     }
                 }
 
@@ -490,6 +520,12 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             // the loop's own token is usually already cancelled here, and the release must still
             // run. ReleaseLeaseAsync makes the call after StopAsync a no-op.
             await ReleaseLeaseAsync(CancellationToken.None);
+
+            // A crash that is never restarted would otherwise leak the poll loop's CTS. During a
+            // StopAsync the field is already null (StopAsync detached it) so this is a no-op and
+            // StopAsync disposes the detached instance; on a crash this is the only dispose.
+            _cts?.Dispose();
+            _cts = null;
         }
     }
 
@@ -524,6 +560,9 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             // Mark as leader before reading the watermarks, so a failure below releases the lease
             // through the same path StopAsync uses. Nothing polls until this method returns true.
             _isLeader = true;
+            // The lease is now (re)held: re-arm the exactly-once release guard for a subsequent
+            // StepDown and the StopAsync that follows.
+            Volatile.Write(ref _leaseReleased, 0);
 
             try
             {
@@ -562,6 +601,9 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         catch (Exception ex)
         {
             RecordLeaseFailure(ex);
+            // If the store comes back and this instance acquires the lease, the standby has ended;
+            // reset the flag so a later loss of the lease re-logs the standby transition.
+            _standbyLogged = false;
             return false;
         }
     }

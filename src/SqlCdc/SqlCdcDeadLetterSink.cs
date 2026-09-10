@@ -138,7 +138,7 @@ public sealed class SqlCdcDeadLetterSink : ICdcDeadLetterSink
     /// maps to, and an exotic one must not cost the dead letter: the payload degrades to strings
     /// rather than throwing away the record.
     /// </summary>
-    private static string SerializePayload(CdcChange change)
+    internal static string SerializePayload(CdcChange change)
     {
         try
         {
@@ -151,21 +151,49 @@ public sealed class SqlCdcDeadLetterSink : ICdcDeadLetterSink
                 },
                 PayloadOptions);
         }
-        catch (NotSupportedException)
+        catch (Exception)
         {
-            return JsonSerializer.Serialize(
-                new
-                {
-                    Before = Stringify(change.Before),
-                    After = Stringify(change.After),
-                    change.UpdateMask,
-                },
-                PayloadOptions);
+            try
+            {
+                return JsonSerializer.Serialize(
+                    new
+                    {
+                        Before = Stringify(change.Before),
+                        After = Stringify(change.After),
+                        change.UpdateMask,
+                    },
+                    PayloadOptions);
+            }
+            catch (Exception ex)
+            {
+                return JsonSerializer.Serialize(
+                    new
+                    {
+                        Error = $"Payload serialization failed: {ex.Message}",
+                        change.UpdateMask,
+                    },
+                    PayloadOptions);
+            }
         }
     }
 
-    private static Dictionary<string, string?> Stringify(IReadOnlyDictionary<string, object?> values) =>
-        values.ToDictionary(pair => pair.Key, pair => pair.Value?.ToString());
+    private static Dictionary<string, string?> Stringify(IReadOnlyDictionary<string, object?> values)
+    {
+        var result = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, value) in values)
+        {
+            try
+            {
+                result[key] = value?.ToString();
+            }
+            catch
+            {
+                result[key] = "<ToString failed>";
+            }
+        }
+
+        return result;
+    }
 
     private async Task EnsureTableAsync(CancellationToken cancellationToken)
     {

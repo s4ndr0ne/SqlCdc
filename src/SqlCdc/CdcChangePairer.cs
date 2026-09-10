@@ -30,6 +30,7 @@ internal static class CdcChangePairer
         IReadOnlyDictionary<string, DateTime> timeMap,
         ILogger? logger = null)
     {
+        var changes = new List<CdcChange>(rows.Count);
         var pendingBefore = new Dictionary<string, RawRow>(StringComparer.OrdinalIgnoreCase);
         var pendingAfter = new Dictionary<string, RawRow>(StringComparer.OrdinalIgnoreCase);
 
@@ -40,17 +41,17 @@ internal static class CdcChangePairer
             switch (row.Operation)
             {
                 case 1: // delete
-                    yield return Create(schema, table, captureInstance, row, CdcOperationType.Delete, row.Values, EmptyValues, EmptyMask, CommitTimeOf(row, timeMap));
+                    changes.Add(Create(schema, table, captureInstance, row, CdcOperationType.Delete, row.Values, EmptyValues, EmptyMask, CommitTimeOf(row, timeMap)));
                     break;
 
                 case 2: // insert
-                    yield return Create(schema, table, captureInstance, row, CdcOperationType.Insert, EmptyValues, row.Values, EmptyMask, CommitTimeOf(row, timeMap));
+                    changes.Add(Create(schema, table, captureInstance, row, CdcOperationType.Insert, EmptyValues, row.Values, EmptyMask, CommitTimeOf(row, timeMap)));
                     break;
 
                 case 3: // update before-image
                     if (pendingAfter.Remove(key, out var after))
                     {
-                        yield return CreateUpdate(schema, table, captureInstance, capturedColumns, row, after, timeMap);
+                        changes.Add(CreateUpdate(schema, table, captureInstance, capturedColumns, row, after, timeMap));
                     }
                     else
                     {
@@ -62,7 +63,7 @@ internal static class CdcChangePairer
                 case 4: // update after-image
                     if (pendingBefore.Remove(key, out var before))
                     {
-                        yield return CreateUpdate(schema, table, captureInstance, capturedColumns, before, row, timeMap);
+                        changes.Add(CreateUpdate(schema, table, captureInstance, capturedColumns, before, row, timeMap));
                     }
                     else
                     {
@@ -87,6 +88,8 @@ internal static class CdcChangePairer
                 $"without a matching after-image and {pendingAfter.Count} after-image row(s) without a matching " +
                 "before-image. The checkpoint was not advanced, so no change is silently lost.");
         }
+
+        return changes;
     }
 
     private static DateTime CommitTimeOf(RawRow row, IReadOnlyDictionary<string, DateTime> timeMap) =>

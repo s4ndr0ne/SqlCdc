@@ -132,10 +132,18 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
 
                 await cmd.ExecuteNonQueryAsync(cancellationToken);
 
-                // 0 granted, 1 granted after waiting. Anything negative means the lock was not
-                // taken, which for @LockTimeout = 0 is simply "another instance holds it".
-                var granted = returnValue.Value is int result && result >= 0;
-                if (!granted)
+                // 0: granted synchronously, 1: granted after waiting.
+                // -1: timeout (held by another session, expected standby state).
+                // < -1: call error, deadlock, or parameter failure (e.g. -999).
+                var result = returnValue.Value as int? ?? -999;
+                if (result < -1)
+                {
+                    await connection.DisposeAsync();
+                    throw new InvalidOperationException(
+                        $"Failed to acquire application lock '{_resource}': sys.sp_getapplock returned error code {result}.");
+                }
+
+                if (result == -1)
                 {
                     await connection.DisposeAsync();
                     return false;
@@ -308,16 +316,6 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
         _connection = null;
         if (connection is not null)
         {
-            // A custom factory can hand out a pooled connection. Clear its pool before returning
-            // it, so a session-scoped application lock can never survive disposal in an idle pool.
-            try
-            {
-                SqlConnection.ClearPool(connection);
-            }
-            catch
-            {
-                // Best effort for broken connections; DisposeAsync below still releases normal ones.
-            }
             await connection.DisposeAsync();
         }
     }

@@ -69,6 +69,9 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// <summary>UTC ticks of when this instance last became a standby; 0 while it is the leader.</summary>
     private long _standbySinceTicks;
 
+    /// <summary>Set once the watcher has been disposed, ensuring DisposeAsync is idempotent.</summary>
+    private int _disposed;
+
     internal SqlCdcWatcher(
         CdcWatcherOptions options,
         ICdcStateStore stateStore,
@@ -213,12 +216,41 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// </summary>
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
         await _stateLock.WaitAsync(cancellationToken);
         try
         {
             if (_pollTask is { IsCompleted: false })
             {
-                return;
+                if (_cts is { IsCancellationRequested: true })
+                {
+                    // A StopAsync is currently waiting for _pollTask to complete.
+                    // Release the lock and await the stopping task so StartAsync starts cleanly.
+                    var stoppingTask = _pollTask;
+                    _stateLock.Release();
+                    try
+                    {
+                        await stoppingTask.WaitAsync(cancellationToken);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception)
+                    {
+                    }
+
+                    await _stateLock.WaitAsync(cancellationToken);
+                    if (_pollTask is { IsCompleted: false })
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    return;
+                }
             }
 
             if (_pollTask is not null)
@@ -275,6 +307,11 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// <summary>Stops the polling loop and completes the channel.</summary>
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return;
+        }
+
         Task? pollTask;
         CancellationTokenSource? cts;
         try
@@ -288,19 +325,10 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         try
         {
             cts = _cts;
-            if (cts is null)
-            {
-                pollTask = null;
-            }
-            else
+            pollTask = _pollTask;
+            if (cts is not null)
             {
                 cts.Cancel();
-                pollTask = _pollTask;
-                // Detached here so the poll task's own finally — which may block on a slow lease
-                // release — no longer holds up StartAsync/StopAsync/DisposeAsync, which all contend
-                // on _stateLock.
-                _cts = null;
-                _pollTask = null;
             }
         }
         finally
@@ -314,7 +342,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         {
             try
             {
-                await pollTask;
+                await pollTask.WaitAsync(cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -322,16 +350,42 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             }
         }
 
-        // Disposed only after the poll task has fully exited, so a running loop cannot trip over a
-        // disposed CTS mid-flight.
-        cts?.Dispose();
-        _channel.Writer.TryComplete();
+        try
+        {
+            await _stateLock.WaitAsync(CancellationToken.None);
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+        try
+        {
+            if (_pollTask == pollTask)
+            {
+                _pollTask = null;
+                _cts = null;
+            }
+
+            // Disposed only after the poll task has fully exited, so a running loop cannot trip over a
+            // disposed CTS mid-flight.
+            cts?.Dispose();
+            _channel.Writer.TryComplete();
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
 
         await ReleaseLeaseAsync(cancellationToken);
     }
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
         await StopAsync();
 
         if (_ownsLeaseProvider)
@@ -1155,6 +1209,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 "Enable CDC first: EXEC sys.sp_cdc_enable_table ...");
         }
 
+        string selected;
         if (subscription.CaptureInstance is { } requested)
         {
             var match = available.FirstOrDefault(
@@ -1162,21 +1217,33 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
             // Without this check a typo only surfaces later, as a "invalid object name
             // cdc.fn_cdc_get_all_changes_..." on every poll.
-            return match ?? throw new InvalidOperationException(
+            selected = match ?? throw new InvalidOperationException(
                 $"Capture instance '{requested}' is not defined for table {table}. " +
                 $"Available: {string.Join(", ", available)}.");
         }
-
-        if (available.Count > 1)
+        else
         {
-            _logger.LogWarning(
-                "Table {Table} has {Count} capture instances ({CaptureInstances}); reading the oldest one, " +
-                "{Selected}. This is expected during a schema migration. Pass the capture instance explicitly " +
-                "to WatchTable to choose, and note that switching starts that instance from its own watermark.",
-                table, available.Count, string.Join(", ", available), available[0]);
+            if (available.Count > 1)
+            {
+                _logger.LogWarning(
+                    "Table {Table} has {Count} capture instances ({CaptureInstances}); reading the oldest one, " +
+                    "{Selected}. This is expected during a schema migration. Pass the capture instance explicitly " +
+                    "to WatchTable to choose, and note that switching starts that instance from its own watermark.",
+                    table, available.Count, string.Join(", ", available), available[0]);
+            }
+
+            selected = available[0];
         }
 
-        return available[0];
+        var functionName = $"fn_cdc_get_all_changes_{selected}";
+        if (functionName.Length > 128)
+        {
+            throw new InvalidOperationException(
+                $"Capture instance '{selected}' for table {table} is too long: the generated CDC function name " +
+                $"'{functionName}' exceeds SQL Server's 128-character identifier limit.");
+        }
+
+        return selected;
     }
 
     private async Task<List<string>> GetCapturedColumnsAsync(SqlConnection conn, string captureInstance, CancellationToken ct)

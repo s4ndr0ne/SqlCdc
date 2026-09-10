@@ -294,6 +294,17 @@ public class CdcChangePairerTests
         Assert.Throws<InvalidOperationException>(() => Pair(logger, first, second));
     }
 
+    [Fact]
+    public void Pair_WhenBatchHasValidInsertsFollowedByOrphanUpdate_ThrowsBeforeEmittingAnyChanges()
+    {
+        var validInsert = Row(2, seqVal: new byte[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, values: Values(("Id", 1)));
+        var orphanBefore = Row(3, seqVal: new byte[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 }, values: Values(("Id", 2)));
+
+        // Pair should throw eagerly during batch processing rather than yielding the valid insert first
+        Assert.Throws<InvalidOperationException>(() =>
+            CdcChangePairer.Pair("dbo", "Orders", "dbo_Orders", Columns, [validInsert, orphanBefore], new Dictionary<string, DateTime>()));
+    }
+
     private static List<CdcChange> Pair(ILogger logger, params RawRow[] rows) =>
         CdcChangePairer.Pair("dbo", "Orders", "dbo_Orders", Columns, rows, new Dictionary<string, DateTime>(), logger)
             .ToList();

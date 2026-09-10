@@ -177,9 +177,10 @@ internal sealed class SqlCdcHostedService : BackgroundService
     private async Task DispatchAsync(CdcChange change, CancellationToken ct)
     {
         using var scope = _scopeFactory.CreateScope();
-        foreach (var handler in scope.ServiceProvider.GetServices<ICdcChangeHandler>())
+        var handlers = scope.ServiceProvider.GetServices<ICdcChangeHandler>().ToList();
+        for (var i = 0; i < handlers.Count; i++)
         {
-            await InvokeHandlerAsync(handler, change, ct);
+            await InvokeHandlerAsync(handlers[i], i, change, ct);
         }
 
         // Acknowledged only after every handler has been given the change, and never on
@@ -192,65 +193,81 @@ internal sealed class SqlCdcHostedService : BackgroundService
     /// and dead-lettering the change when the attempts run out. Returning normally after a failure
     /// is deliberate: one poisonous change must not block every change behind it.
     /// </summary>
-    private async Task InvokeHandlerAsync(ICdcChangeHandler handler, CdcChange change, CancellationToken ct)
+    private async Task InvokeHandlerAsync(
+        ICdcChangeHandler initialHandler, int handlerIndex, CdcChange change, CancellationToken ct)
     {
+        var handler = initialHandler;
         var handlerName = handler.GetType().Name;
         var maxAttempts = _watcher.Options.MaxHandlerAttempts;
+        IServiceScope? retryScope = null;
 
-        for (var attempt = 1; ; attempt++)
+        try
         {
-            using var activity = SqlCdcDiagnostics.ActivitySource.StartActivity(
-                "SqlCdc.Handle", ActivityKind.Consumer);
-            activity?.SetTag("watcher", _watcher.Name);
-            activity?.SetTag("capture_instance", change.CaptureInstance);
-            activity?.SetTag("table", change.TableName);
-            activity?.SetTag("operation", change.Operation.ToString());
-            activity?.SetTag("change_key", change.Key);
-            activity?.SetTag("handler", handlerName);
-            activity?.SetTag("attempt", attempt);
+            for (var attempt = 1; ; attempt++)
+            {
+                using var activity = SqlCdcDiagnostics.ActivitySource.StartActivity(
+                    "SqlCdc.Handle", ActivityKind.Consumer);
+                activity?.SetTag("watcher", _watcher.Name);
+                activity?.SetTag("capture_instance", change.CaptureInstance);
+                activity?.SetTag("table", change.TableName);
+                activity?.SetTag("operation", change.Operation.ToString());
+                activity?.SetTag("change_key", change.Key);
+                activity?.SetTag("handler", handlerName);
+                activity?.SetTag("attempt", attempt);
 
-            var startedAt = Stopwatch.GetTimestamp();
-            try
-            {
-                await handler.HandleAsync(change, ct);
-                RecordHandlerDuration(handlerName, change, "success", startedAt);
-                return;
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                var willRetry = attempt < maxAttempts;
-                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
-                RecordHandlerDuration(handlerName, change, willRetry ? "retry" : "failed", startedAt);
-                SqlCdcDiagnostics.HandlerFailures.Add(1, HandlerTags(handlerName, change));
-
-                if (willRetry)
+                var startedAt = Stopwatch.GetTimestamp();
+                try
                 {
-                    var delay = BackoffFor(attempt);
-                    _logger.LogWarning(
-                        ex,
-                        "Handler {Handler} failed for change {ChangeKey} on {TableName} " +
-                        "(attempt {Attempt} of {MaxAttempts}); retrying in {RetryDelay}",
-                        handlerName, change.Key, change.TableName, attempt, maxAttempts, delay);
-
-                    await Task.Delay(delay, ct);
-                    continue;
+                    await handler.HandleAsync(change, ct);
+                    RecordHandlerDuration(handlerName, change, "success", startedAt);
+                    return;
                 }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    var willRetry = attempt < maxAttempts;
+                    activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                    RecordHandlerDuration(handlerName, change, willRetry ? "retry" : "failed", startedAt);
+                    SqlCdcDiagnostics.HandlerFailures.Add(1, HandlerTags(handlerName, change));
 
-                _logger.LogError(
-                    ex,
-                    "Handler {Handler} failed for change {ChangeKey} on {TableName} after {Attempts} attempt(s); " +
-                    "the event is {Outcome}",
-                    handlerName, change.Key, change.TableName, attempt,
-                    _deadLetterSink is null ? "dropped" : "dead-lettered");
+                    if (willRetry)
+                    {
+                        var delay = BackoffFor(attempt);
+                        _logger.LogWarning(
+                            ex,
+                            "Handler {Handler} failed for change {ChangeKey} on {TableName} " +
+                            "(attempt {Attempt} of {MaxAttempts}); retrying in {RetryDelay}",
+                            handlerName, change.Key, change.TableName, attempt, maxAttempts, delay);
 
-                await DeadLetterAsync(
-                    new CdcDeadLetter(change, handlerName, attempt, ex, DateTimeOffset.UtcNow), ct);
-                return;
+                        await Task.Delay(delay, ct);
+
+                        // Scoped dependencies (such as an EF Core DbContext) may be left corrupted
+                        // after a failure. Create a fresh scope for each retry attempt.
+                        retryScope?.Dispose();
+                        retryScope = _scopeFactory.CreateScope();
+                        handler = retryScope.ServiceProvider.GetServices<ICdcChangeHandler>().ElementAt(handlerIndex);
+                        continue;
+                    }
+
+                    _logger.LogError(
+                        ex,
+                        "Handler {Handler} failed for change {ChangeKey} on {TableName} after {Attempts} attempt(s); " +
+                        "the event is {Outcome}",
+                        handlerName, change.Key, change.TableName, attempt,
+                        _deadLetterSink is null ? "dropped" : "dead-lettered");
+
+                    await DeadLetterAsync(
+                        new CdcDeadLetter(change, handlerName, attempt, ex, DateTimeOffset.UtcNow), ct);
+                    return;
+                }
             }
+        }
+        finally
+        {
+            retryScope?.Dispose();
         }
     }
 

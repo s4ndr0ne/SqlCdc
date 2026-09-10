@@ -34,6 +34,41 @@ public class WatcherLeaseLifecycleTests
         Assert.Equal(0, lease.ReleaseAttempts);
     }
 
+    [Fact]
+    public async Task DisposeAsync_CanBeCalledRepeatedly_WithoutThrowing()
+    {
+        var lease = new RecordingLeaseProvider();
+        var watcher = new SqlCdcWatcher(
+            Options(),
+            new InMemoryCdcStateStore(),
+            logger: null,
+            leaseProvider: lease,
+            ownsLeaseProvider: false,
+            connections: new UnitTestConnectionFactory());
+
+        await watcher.DisposeAsync();
+        // Second call must be idempotent and not throw ObjectDisposedException
+        await watcher.DisposeAsync();
+        await watcher.StopAsync();
+    }
+
+    [Fact]
+    public async Task StartAsync_AfterDispose_ThrowsObjectDisposedException()
+    {
+        var lease = new RecordingLeaseProvider();
+        var watcher = new SqlCdcWatcher(
+            Options(),
+            new InMemoryCdcStateStore(),
+            logger: null,
+            leaseProvider: lease,
+            ownsLeaseProvider: false,
+            connections: new UnitTestConnectionFactory());
+
+        await watcher.DisposeAsync();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => watcher.StartAsync());
+    }
+
     /// <summary>Counts ReleaseAsync calls so the test can assert on exactly-once behaviour.</summary>
     private sealed class RecordingLeaseProvider : ICdcLeaseProvider
     {

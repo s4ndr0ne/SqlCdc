@@ -37,7 +37,12 @@ public sealed class SqlCdcConnectionFactory : ICdcConnectionFactory
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
 
-        _connectionString = connectionString;
+        var builder = new SqlConnectionStringBuilder(connectionString)
+        {
+            Encrypt = true
+        };
+
+        _connectionString = builder.ConnectionString;
         _accessTokenCallback = accessTokenCallback;
     }
 

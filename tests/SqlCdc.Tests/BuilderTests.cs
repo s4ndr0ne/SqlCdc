@@ -12,7 +12,7 @@ public class BuilderTests
     [Fact]
     public void Build_WithoutTables_Throws()
     {
-        var builder = SqlCdcWatcherBuilder.Create().UseConnectionString("Server=.;Database=x");
+        var builder = SqlCdcWatcherBuilder.Create().UseConnectionString("Server=.;Database=x;Encrypt=True");
         Assert.Throws<InvalidOperationException>(() => builder.Build());
     }
 
@@ -21,7 +21,7 @@ public class BuilderTests
     {
         var watcher = SqlCdcWatcherBuilder
             .Create()
-            .UseConnectionString("Server=.;Database=x")
+            .UseConnectionString("Server=.;Database=x;Encrypt=True")
             .WatchTable("dbo", "Orders")
             .Build();
 
@@ -34,7 +34,7 @@ public class BuilderTests
     {
         var watcher = SqlCdcWatcherBuilder
             .Create()
-            .UseConnectionString("Server=.;Database=x")
+            .UseConnectionString("Server=.;Database=x;Encrypt=True")
             .WatchTable("dbo", "Orders")
             .Build();
 
@@ -48,7 +48,7 @@ public class BuilderTests
         // lease, or one of them would stand by forever while looking healthy.
         var watcher = SqlCdcWatcherBuilder
             .Create()
-            .UseConnectionString("Server=.;Database=x")
+            .UseConnectionString("Server=.;Database=x;Encrypt=True")
             .WatchTable("dbo", "Orders")
             .WithName("sales")
             .Build();
@@ -62,7 +62,7 @@ public class BuilderTests
     {
         var watcher = SqlCdcWatcherBuilder
             .Create()
-            .UseConnectionString("Server=.;Database=x")
+            .UseConnectionString("Server=.;Database=x;Encrypt=True")
             .WatchTable("dbo", "Orders")
             .WithName("sales")
             .UseSingleActiveInstance("shared")
@@ -77,7 +77,7 @@ public class BuilderTests
     {
         var watcher = SqlCdcWatcherBuilder
             .Create()
-            .UseConnectionString("Server=.;Database=x")
+            .UseConnectionString("Server=.;Database=x;Encrypt=True")
             .WatchTable("dbo", "Orders")
             .WithoutSingleActiveInstance()
             .Build();
@@ -92,7 +92,7 @@ public class BuilderTests
     {
         var builder = SqlCdcWatcherBuilder
             .Create()
-            .UseConnectionString("Server=.;Database=x")
+            .UseConnectionString("Server=.;Database=x;Encrypt=True")
             .WatchTable("dbo", "Orders");
 
         Assert.Throws<ArgumentOutOfRangeException>(() => builder.WithPollInterval(TimeSpan.FromSeconds(seconds)));
@@ -118,7 +118,7 @@ public class BuilderTests
     {
         var builder = SqlCdcWatcherBuilder
             .Create()
-            .UseConnectionString("Server=.;Database=x")
+            .UseConnectionString("Server=.;Database=x;Encrypt=True")
             .WatchTable("dbo", "Orders");
 
         Assert.Throws<ArgumentOutOfRangeException>(() => builder.WithLeaseRetryDelay(TimeSpan.FromSeconds(seconds)));
@@ -140,7 +140,7 @@ public class BuilderTests
     {
         await using var watcher = SqlCdcWatcherBuilder
             .Create()
-            .UseConnectionString("Server=.;Database=x")
+            .UseConnectionString("Server=.;Database=x;Encrypt=True")
             .WatchTable("dbo", "Orders")
             .UseSingleActiveInstance("orders")
             .WithCheckpointMode(CdcCheckpointMode.OnAcknowledgement)
@@ -244,7 +244,7 @@ public class BuilderTests
     {
         await using var watcher = SqlCdcWatcherBuilder
             .Create()
-            .UseConnectionString("Server=.;Database=x")
+            .UseConnectionString("Server=.;Database=x;Encrypt=True")
             .WatchTable("dbo", "Orders")
             .WithName("orders")
             .WithHandlerRetry(3, TimeSpan.FromMilliseconds(50))

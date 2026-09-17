@@ -1,7 +1,7 @@
 using SqlCdc;
 
 var connectionString = Environment.GetEnvironmentVariable("SQLCDC_CONNECTION")
-    ?? "Server=localhost;Database=MyDb;User Id=sa;Password=Your_password123;TrustServerCertificate=True";
+    ?? "Server=localhost;Database=MyDb;User Id=sa;Password=Your_password123;Encrypt=True;TrustServerCertificate=True";
 
 var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>

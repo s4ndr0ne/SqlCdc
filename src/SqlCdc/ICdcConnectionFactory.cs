@@ -106,6 +106,12 @@ internal sealed class DelegateCdcConnectionFactory : ICdcConnectionFactory
         // is an easy mistake and cheap to absorb.
         if (connection.State != System.Data.ConnectionState.Open)
         {
+            var builder = new SqlConnectionStringBuilder(connection.ConnectionString)
+            {
+                Encrypt = true
+            };
+            connection.ConnectionString = builder.ConnectionString;
+
             try
             {
                 await connection.OpenAsync(cancellationToken);

@@ -14,7 +14,7 @@ public class LeaseProviderConfigTests
     {
         var watcher = SqlCdcWatcherBuilder
             .Create()
-            .UseConnectionString("Server=.;Database=x")
+            .UseConnectionString("Server=.;Database=x;Encrypt=True")
             .WatchTable("dbo", "Orders")
             .WithCommandTimeout(TimeSpan.FromSeconds(42))
             .UseSingleActiveInstance("orders")
@@ -29,7 +29,7 @@ public class LeaseProviderConfigTests
     {
         var watcher = SqlCdcWatcherBuilder
             .Create()
-            .UseConnectionString("Server=.;Database=x")
+            .UseConnectionString("Server=.;Database=x;Encrypt=True")
             .WatchTable("dbo", "Orders")
             .UseSingleActiveInstance("orders")
             .Build();
@@ -41,7 +41,7 @@ public class LeaseProviderConfigTests
     [Fact]
     public void PublicConstructor_FallsBackToABoundedTimeout()
     {
-        var lease = new SqlApplicationLockLeaseProvider("Server=.;Database=x", "orders");
+        var lease = new SqlApplicationLockLeaseProvider("Server=.;Database=x;Encrypt=True", "orders");
         Assert.Equal(30, CommandTimeoutSeconds(lease));
     }
 

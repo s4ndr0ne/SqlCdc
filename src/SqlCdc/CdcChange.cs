@@ -40,7 +40,7 @@ public sealed record CdcChange
     /// Acknowledgement handle, set only when the watcher runs in
     /// <see cref="CdcCheckpointMode.OnAcknowledgement"/>.
     /// </summary>
-    internal ChangeAcknowledgement? Acknowledgement { get; init; }
+    internal ChangeDeliveryReceipt? Acknowledgement { get; init; }
 
     /// <summary>Stable per-change identifier, combining LSN and sequence value.</summary>
     public string Key => $"{Convert.ToHexString(StartLsn)}-{Convert.ToHexString(SeqVal)}";

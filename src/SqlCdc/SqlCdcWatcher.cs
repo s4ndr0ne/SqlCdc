@@ -14,6 +14,7 @@ namespace SqlCdc;
 /// </summary>
 public sealed class SqlCdcWatcher : IAsyncDisposable
 {
+
     /// <summary>Number of LSNs mapped to commit times in a single round-trip.</summary>
     private const int LsnTimeMapChunkSize = 500;
 
@@ -71,6 +72,9 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
     /// <summary>Set once the watcher has been disposed, ensuring DisposeAsync is idempotent.</summary>
     private int _disposed;
+
+    /// <summary>Explicit lifecycle coordinator for start/stop/dispose transitions.</summary>
+    private readonly WatcherLifecycleCoordinator _lifecycle = new();
 
     internal SqlCdcWatcher(
         CdcWatcherOptions options,
@@ -194,8 +198,57 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// </summary>
     public IAsyncEnumerable<CdcChange> Changes => _channel.Reader.ReadAllAsync();
 
-    /// <summary>True while the polling loop is running.</summary>
-    public bool IsRunning => _pollTask is { IsCompleted: false };
+    /// <summary>True while the polling loop is running or is being started.</summary>
+    public bool IsRunning => IsPollLoopActive();
+
+    private bool IsPollLoopActive() => _lifecycle.IsRunning;
+
+    private void UpdateLifecycleState(WatcherLifecycleState next)
+    {
+        if (Volatile.Read(ref _disposed) != 0 && next != WatcherLifecycleState.Disposed)
+        {
+            return;
+        }
+
+        _lifecycle.TransitionTo(next);
+    }
+
+    private bool BeginStartIfIdle()
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return false;
+        }
+
+        return _lifecycle.TryBeginStart();
+    }
+
+    private bool BeginStopIfActive() => _lifecycle.TryBeginStop();
+
+    private void FinishStop(bool disposed) => _lifecycle.CompleteStop(disposed);
+
+    private void FinishFailedStart() => _lifecycle.CompleteStartFailure();
+
+    private void FinishPollLoop() => _lifecycle.CompleteRunLoop(Volatile.Read(ref _disposed) != 0);
+
+    private void ResetRuntimeState()
+    {
+        _isLeader = false;
+        _crashed = false;
+        _standbyLogged = false;
+        Volatile.Write(ref _leaseFailures, 0);
+        Volatile.Write(ref _leaseReleased, 0);
+        Volatile.Write(ref _standbySinceTicks, DateTimeOffset.UtcNow.UtcTicks);
+    }
+
+    private void ClearPollTaskIfMatches(Task? expectedTask)
+    {
+        if (_pollTask == expectedTask)
+        {
+            _pollTask = null;
+            _cts = null;
+        }
+    }
 
     /// <summary>
     /// True while this instance holds the lease and is therefore the one polling. Always true when
@@ -218,17 +271,26 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
+        var stateLockHeld = false;
+        var startBegan = false;
         await _stateLock.WaitAsync(cancellationToken);
+        stateLockHeld = true;
         try
         {
-            if (_pollTask is { IsCompleted: false })
+            if (IsPollLoopActive() || _pollTask is { IsCompleted: false })
             {
                 if (_cts is { IsCancellationRequested: true })
                 {
                     // A StopAsync is currently waiting for _pollTask to complete.
                     // Release the lock and await the stopping task so StartAsync starts cleanly.
                     var stoppingTask = _pollTask;
+                    if (stoppingTask is null)
+                    {
+                        return;
+                    }
+
                     _stateLock.Release();
+                    stateLockHeld = false;
                     try
                     {
                         await stoppingTask.WaitAsync(cancellationToken);
@@ -242,7 +304,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     }
 
                     await _stateLock.WaitAsync(cancellationToken);
-                    if (_pollTask is { IsCompleted: false })
+                    stateLockHeld = true;
+                    if (IsPollLoopActive() || _pollTask is { IsCompleted: false })
                     {
                         return;
                     }
@@ -253,7 +316,14 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 }
             }
 
-            if (_pollTask is not null)
+            if (!BeginStartIfIdle())
+            {
+                return;
+            }
+
+            startBegan = true;
+
+            if (_pollTask is not null || _channel.Reader.Completion.IsCompleted)
             {
                 _channel.Writer.TryComplete();
                 _cts?.Dispose();
@@ -280,15 +350,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             }
 
             Interlocked.Exchange(ref _tables, resolved);
-
-            _isLeader = false;
-            _crashed = false;
-            _standbyLogged = false;
-            Volatile.Write(ref _leaseFailures, 0);
-            // A fresh start means a release (if any) from the previous run has long since happened;
-            // re-arm the exactly-once guard so this run can release again on StopAsync.
-            Volatile.Write(ref _leaseReleased, 0);
-            Volatile.Write(ref _standbySinceTicks, DateTimeOffset.UtcNow.UtcTicks);
+            ResetRuntimeState();
 
             // The token passed to StartAsync bounds startup work (capture-instance discovery).
             // Once started, lifecycle is controlled by StopAsync; a caller's startup timeout must
@@ -297,17 +359,35 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             var token = cts.Token;
             _cts = cts;
             _pollTask = Task.Run(() => RunLoopAsync(token));
+            UpdateLifecycleState(WatcherLifecycleState.Running);
+        }
+        catch
+        {
+            if (startBegan)
+            {
+                FinishFailedStart();
+            }
+
+            throw;
         }
         finally
         {
-            _stateLock.Release();
+            if (stateLockHeld)
+            {
+                _stateLock.Release();
+            }
         }
     }
 
     /// <summary>Stops the polling loop and completes the channel.</summary>
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {
-        if (Volatile.Read(ref _disposed) != 0)
+        await StopAsyncCore(cancellationToken, calledFromDispose: false);
+    }
+
+    private async Task StopAsyncCore(CancellationToken cancellationToken, bool calledFromDispose)
+    {
+        if (!calledFromDispose && Volatile.Read(ref _disposed) != 0)
         {
             return;
         }
@@ -326,6 +406,11 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         {
             cts = _cts;
             pollTask = _pollTask;
+            if (!BeginStopIfActive())
+            {
+                return;
+            }
+
             if (cts is not null)
             {
                 cts.Cancel();
@@ -346,35 +431,13 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                // The loop stopped as requested; nothing to surface.
+                // The caller cancelled only its wait. Leave cleanup to the polling loop's finally
+                // so a later StartAsync cannot race a still-running task or a disposed CTS.
+                return;
             }
         }
 
-        try
-        {
-            await _stateLock.WaitAsync(CancellationToken.None);
-        }
-        catch (ObjectDisposedException)
-        {
-            return;
-        }
-        try
-        {
-            if (_pollTask == pollTask)
-            {
-                _pollTask = null;
-                _cts = null;
-            }
-
-            // Disposed only after the poll task has fully exited, so a running loop cannot trip over a
-            // disposed CTS mid-flight.
-            cts?.Dispose();
-            _channel.Writer.TryComplete();
-        }
-        finally
-        {
-            _stateLock.Release();
-        }
+        await FinishStopAsync(pollTask, cts, calledFromDispose, cancellationToken);
 
         await ReleaseLeaseAsync(cancellationToken);
     }
@@ -386,7 +449,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             return;
         }
 
-        await StopAsync();
+        await StopAsyncCore(CancellationToken.None, calledFromDispose: true);
+        _lifecycle.TransitionTo(WatcherLifecycleState.Disposed);
 
         if (_ownsLeaseProvider)
         {
@@ -395,6 +459,37 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
         SqlCdcDiagnostics.Unregister(this);
         _stateLock.Dispose();
+    }
+
+    private async Task FinishStopAsync(
+        Task? pollTask,
+        CancellationTokenSource? cts,
+        bool calledFromDispose,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _stateLock.WaitAsync(CancellationToken.None);
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
+        try
+        {
+            ClearPollTaskIfMatches(pollTask);
+
+            // Disposed only after the poll task has fully exited, so a running loop cannot trip over a
+            // disposed CTS mid-flight.
+            cts?.Dispose();
+            _channel.Writer.TryComplete();
+            FinishStop(calledFromDispose);
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
     }
 
     /// <summary>
@@ -566,7 +661,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         finally
         {
             // External cancellation must complete readers too; StopAsync remains responsible for
-            // disposing the CTS and allowing a later StartAsync to create a fresh channel.
+            // creating a fresh channel on a later StartAsync.
             _channel.Writer.TryComplete();
 
             // Whatever ended the loop, this instance no longer polls: hand the lease back so a
@@ -575,11 +670,32 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             // run. ReleaseLeaseAsync makes the call after StopAsync a no-op.
             await ReleaseLeaseAsync(CancellationToken.None);
 
-            // A crash that is never restarted would otherwise leak the poll loop's CTS. During a
-            // StopAsync the field is already null (StopAsync detached it) so this is a no-op and
-            // StopAsync disposes the detached instance; on a crash this is the only dispose.
+            await CompletePollLoopAsync();
+        }
+    }
+
+    private async Task CompletePollLoopAsync()
+    {
+        try
+        {
+            await _stateLock.WaitAsync(CancellationToken.None);
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
+        try
+        {
+            // A completed loop cannot remain Running or Stopping. Keep the completed task until
+            // StartAsync observes it, so a new loop never overlaps this final cleanup.
+            FinishPollLoop();
             _cts?.Dispose();
             _cts = null;
+        }
+        finally
+        {
+            _stateLock.Release();
         }
     }
 
@@ -702,7 +818,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         {
             // Unable to tell is treated as lost: the lease lives on a connection, and a connection
             // that cannot answer may well have dropped it already.
-            StepDown();
+            await ReleaseLeaseAsync(ct);
             RecordLeaseFailure(ex);
             return false;
         }
@@ -848,8 +964,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 SqlCdcDiagnostics.BatchRows.Record(batch.Rows.Count, TableTags(table));
 
                 var (timeMap, serverTime) = await MapLsnToTimeAsync(conn, batch.Rows.Select(r => r.Lsn), ct);
-                var barrier = _options.CheckpointMode == CdcCheckpointMode.OnAcknowledgement
-                    ? new CheckpointBarrier()
+                var ledger = _options.CheckpointMode == CdcCheckpointMode.OnAcknowledgement
+                    ? new ChangeDeliveryLedger()
                     : null;
                 var emitted = 0;
 
@@ -857,8 +973,8 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     table.Schema, table.Table, table.CaptureInstance, table.CapturedColumns, batch.Rows, timeMap, _logger))
                 {
                     // Registered before the change is written: once it is on the channel a consumer
-                    // can acknowledge it at any moment, and the barrier must already know about it.
-                    var published = barrier is null ? change : change with { Acknowledgement = barrier.Register() };
+                    // can acknowledge it at any moment, and the ledger must already know about it.
+                    var published = ledger is null ? change : change with { Acknowledgement = ledger.Register() };
                     await WriteToChannelAsync(table, published, conn, ct);
 
                     emitted++;
@@ -868,10 +984,10 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 Interlocked.Add(ref table.ChangesEmitted, emitted);
                 activity?.SetTag("changes", emitted);
 
-                if (barrier is not null)
+                if (ledger is not null)
                 {
-                    barrier.Seal();
-                    await WaitForAcknowledgementsAsync(table, barrier, conn, ct);
+                    ledger.Seal();
+                    await WaitForAcknowledgementsAsync(table, ledger, conn, ct);
                 }
 
                 // Delivery that stalled long enough gave the connection back (see
@@ -992,14 +1108,14 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
     /// periodically rather than left silent.
     /// </summary>
     private async Task WaitForAcknowledgementsAsync(
-        TableRuntime table, CheckpointBarrier barrier, SqlConnection conn, CancellationToken ct)
+        TableRuntime table, ChangeDeliveryLedger ledger, SqlConnection conn, CancellationToken ct)
     {
         var waited = TimeSpan.Zero;
         while (true)
         {
             try
             {
-                await barrier.Completion.WaitAsync(CheckpointWarningInterval, ct);
+                await ledger.Completion.WaitAsync(CheckpointWarningInterval, ct);
                 return;
             }
             catch (TimeoutException)

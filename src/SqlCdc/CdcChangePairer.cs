@@ -55,7 +55,7 @@ internal static class CdcChangePairer
                     }
                     else
                     {
-                        pendingBefore[key] = row;
+                        AddPending(pendingBefore, key, row, captureInstance);
                     }
 
                     break;
@@ -67,7 +67,7 @@ internal static class CdcChangePairer
                     }
                     else
                     {
-                        pendingAfter[key] = row;
+                        AddPending(pendingAfter, key, row, captureInstance);
                     }
 
                     break;
@@ -90,6 +90,20 @@ internal static class CdcChangePairer
         }
 
         return changes;
+    }
+
+    private static void AddPending(
+        IDictionary<string, RawRow> pending,
+        string key,
+        RawRow row,
+        string captureInstance)
+    {
+        if (!pending.TryAdd(key, row))
+        {
+            throw new InvalidOperationException(
+                $"Capture instance '{captureInstance}' produced ambiguous update images with the same __$seqval. " +
+                "The checkpoint was not advanced, so no update is silently paired with the wrong row.");
+        }
     }
 
     private static DateTime CommitTimeOf(RawRow row, IReadOnlyDictionary<string, DateTime> timeMap) =>

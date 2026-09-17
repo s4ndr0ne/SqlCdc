@@ -23,6 +23,9 @@ the previous behaviour explicitly; see **Migrating** below.
   are acknowledged automatically; code that reads `watcher.Changes` directly must call
   `CdcChange.Acknowledge()` on every change, or polling stalls at the first batch (reported every
   30 seconds).
+- Delivery tracking for `OnAcknowledgement` is now handled by an internal delivery ledger that
+  records pending acknowledgements and completes each batch only after all its changes have been
+  acknowledged. The public `CdcChange.Acknowledge()` API and its idempotent behaviour are unchanged.
 - **Leader election is on by default**, on a lease named after the watcher (`WithName`, `default`
   unless set). Replicas of one application share the name and elect a single active instance;
   watchers with different names never contend. `UseSingleActiveInstance` now takes an optional
@@ -90,6 +93,13 @@ the previous behaviour explicitly; see **Migrating** below.
 
 ### Fixed
 
+- A failed watcher startup, a cancelled stop wait, or an unexpected poll-loop exit could leave the
+  watcher in a non-restartable lifecycle state. The lifecycle now returns to idle once the active
+  operation has ended, so a later `StartAsync` creates a fresh polling run.
+- Multiple unmatched update images with the same `__$seqval` were paired FIFO even though the CDC
+  change function exposes no identifier to prove which before-image belongs to which after-image.
+  The watcher now fails the batch without advancing its checkpoint rather than emit a silently
+  corrupted update.
 - Catching up on a large backlog cost time quadratic in its size: the batch cap stopped reading
   after `WithBatchSize` rows, but the query still returned the whole remaining range and the
   client drained it on every poll. Each poll now transfers one batch (see Changed). A single

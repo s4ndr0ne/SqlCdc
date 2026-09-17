@@ -95,6 +95,20 @@ public class CdcChangePairerTests
     }
 
     [Fact]
+    public void AmbiguousUpdatesWithTheSameSequenceValue_Throw()
+    {
+        var firstBefore = Row(3, values: Values(("Id", 1), ("Name", "First")));
+        var secondBefore = Row(3, seqVal: firstBefore.SeqVal, values: Values(("Id", 2), ("Name", "Second")));
+        var firstAfter = Row(4, seqVal: firstBefore.SeqVal, values: Values(("Id", 1), ("Name", "First updated")));
+        var secondAfter = Row(4, seqVal: firstBefore.SeqVal, values: Values(("Id", 2), ("Name", "Second updated")));
+
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            Pair(firstBefore, secondBefore, firstAfter, secondAfter));
+
+        Assert.Contains("ambiguous update images", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void Key_IsStableForSameLsnAndSeqVal()
     {
         var row = Row(2, values: Values(("Id", 1), ("Name", "Widget"), ("Price", 9.99m)));

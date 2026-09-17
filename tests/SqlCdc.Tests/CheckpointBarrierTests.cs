@@ -1,11 +1,11 @@
 namespace SqlCdc.Tests;
 
-public class CheckpointBarrierTests
+public class ChangeDeliveryLedgerTests
 {
     [Fact]
     public void EmptyBatch_CompletesOnSeal()
     {
-        var barrier = new CheckpointBarrier();
+        var barrier = new ChangeDeliveryLedger();
         Assert.False(barrier.Completion.IsCompleted);
 
         barrier.Seal();
@@ -16,24 +16,27 @@ public class CheckpointBarrierTests
     [Fact]
     public void Batch_DoesNotComplete_UntilEveryChangeIsAcknowledged()
     {
-        var barrier = new CheckpointBarrier();
+        var barrier = new ChangeDeliveryLedger();
         var first = barrier.Register();
         var second = barrier.Register();
+        Assert.Equal(3, barrier.Outstanding);
         barrier.Seal();
 
         Assert.False(barrier.Completion.IsCompleted);
 
         first.Acknowledge();
+        Assert.Equal(1, barrier.Outstanding);
         Assert.False(barrier.Completion.IsCompleted);
 
         second.Acknowledge();
+        Assert.Equal(0, barrier.Outstanding);
         Assert.True(barrier.Completion.IsCompleted);
     }
 
     [Fact]
     public void Batch_DoesNotComplete_BeforeItIsSealed()
     {
-        var barrier = new CheckpointBarrier();
+        var barrier = new ChangeDeliveryLedger();
 
         // The consumer can drain the channel faster than the poller writes to it. Completing here
         // would let the watermark jump ahead of changes that have not been published yet.
@@ -47,7 +50,7 @@ public class CheckpointBarrierTests
     [Fact]
     public void AcknowledgingTwice_CountsOnce()
     {
-        var barrier = new CheckpointBarrier();
+        var barrier = new ChangeDeliveryLedger();
         var first = barrier.Register();
         barrier.Register();
         barrier.Seal();
@@ -68,7 +71,7 @@ public class CheckpointBarrierTests
     [Fact]
     public void ChangeAcknowledge_ReleasesTheBarrier()
     {
-        var barrier = new CheckpointBarrier();
+        var barrier = new ChangeDeliveryLedger();
         var change = CreateChange() with { Acknowledgement = barrier.Register() };
         barrier.Seal();
 

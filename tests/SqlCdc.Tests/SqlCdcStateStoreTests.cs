@@ -4,7 +4,7 @@ namespace SqlCdc.Tests;
 
 public class SqlCdcStateStoreTests
 {
-    private const string ConnectionString = "Server=.;Database=Cdc;Integrated Security=True";
+    private const string ConnectionString = "Server=.;Database=Cdc;Integrated Security=True;Encrypt=True";
 
     private sealed class FakeConnectionFactory : ICdcConnectionFactory
     {
@@ -25,7 +25,7 @@ public class SqlCdcStateStoreTests
     {
         // Regression: the watcher saved watermarks on its poll connection whatever database the
         // store pointed at, so a store on a separate database read from one place and wrote to another.
-        var store = new SqlCdcStateStore("Server=.;Database=Ops;Integrated Security=True");
+        var store = new SqlCdcStateStore("Server=.;Database=Ops;Integrated Security=True;Encrypt=True");
 
         Assert.False(store.SharesConnectionsWith(new SqlCdcConnectionFactory(ConnectionString)));
     }

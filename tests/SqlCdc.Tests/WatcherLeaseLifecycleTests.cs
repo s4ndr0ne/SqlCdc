@@ -11,7 +11,7 @@ public class WatcherLeaseLifecycleTests
 {
     private static CdcWatcherOptions Options() => new()
     {
-        ConnectionString = "Server=.;Database=x",
+        ConnectionString = "Server=.;Database=x;Encrypt=True;",
         Tables = [new CdcTableSubscription("dbo", "Orders")],
         PollInterval = TimeSpan.FromMilliseconds(50),
         LeaseRetryDelay = TimeSpan.FromMilliseconds(10),

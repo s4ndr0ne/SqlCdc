@@ -16,13 +16,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Testcontainers pulls in SSH.NET for its port forwarding, and its latest release still
-         resolves to a version with a published advisory. It never leaves the test host and is
-         not part of the shipped package; revisit when Testcontainers updates the dependency. -->
-    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-q939-rpr3-3284" />
-  </ItemGroup>
-
-  <ItemGroup>
     <Using Include="Xunit" />
   </ItemGroup>
 

@@ -341,7 +341,12 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 // Watermarks are not read here: they are loaded once the lease is held, because a
                 // standby instance must not act on a watermark the active one has since advanced.
                 var runtime = await ResolveTableAsync(subscription, cancellationToken);
-                resolved[runtime.CaptureInstance] = runtime;
+                if (!resolved.TryAdd(runtime.CaptureInstance, runtime))
+                {
+                    throw new InvalidOperationException(
+                        $"Capture instance '{runtime.CaptureInstance}' is configured more than once. " +
+                        "Each capture instance can only be watched once.");
+                }
             }
 
             if (resolved.Count == 0)

@@ -28,7 +28,8 @@ internal static class CdcChangePairer
         IReadOnlyList<string> capturedColumns,
         IReadOnlyList<RawRow> rows,
         IReadOnlyDictionary<string, DateTime> timeMap,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        System.Diagnostics.ActivityContext? traceContext = null)
     {
         var changes = new List<CdcChange>(rows.Count);
         var pendingBefore = new Dictionary<string, RawRow>(StringComparer.OrdinalIgnoreCase);
@@ -41,17 +42,17 @@ internal static class CdcChangePairer
             switch (row.Operation)
             {
                 case 1: // delete
-                    changes.Add(Create(schema, table, captureInstance, row, CdcOperationType.Delete, row.Values, EmptyValues, EmptyMask, CommitTimeOf(row, timeMap)));
+                    changes.Add(Create(schema, table, captureInstance, row, CdcOperationType.Delete, row.Values, EmptyValues, EmptyMask, CommitTimeOf(row, timeMap), traceContext));
                     break;
 
                 case 2: // insert
-                    changes.Add(Create(schema, table, captureInstance, row, CdcOperationType.Insert, EmptyValues, row.Values, EmptyMask, CommitTimeOf(row, timeMap)));
+                    changes.Add(Create(schema, table, captureInstance, row, CdcOperationType.Insert, EmptyValues, row.Values, EmptyMask, CommitTimeOf(row, timeMap), traceContext));
                     break;
 
                 case 3: // update before-image
                     if (pendingAfter.Remove(key, out var after))
                     {
-                        changes.Add(CreateUpdate(schema, table, captureInstance, capturedColumns, row, after, timeMap));
+                        changes.Add(CreateUpdate(schema, table, captureInstance, capturedColumns, row, after, timeMap, traceContext));
                     }
                     else
                     {
@@ -63,7 +64,7 @@ internal static class CdcChangePairer
                 case 4: // update after-image
                     if (pendingBefore.Remove(key, out var before))
                     {
-                        changes.Add(CreateUpdate(schema, table, captureInstance, capturedColumns, before, row, timeMap));
+                        changes.Add(CreateUpdate(schema, table, captureInstance, capturedColumns, before, row, timeMap, traceContext));
                     }
                     else
                     {
@@ -116,13 +117,15 @@ internal static class CdcChangePairer
         IReadOnlyList<string> capturedColumns,
         RawRow before,
         RawRow after,
-        IReadOnlyDictionary<string, DateTime> timeMap) =>
+        IReadOnlyDictionary<string, DateTime> timeMap,
+        System.Diagnostics.ActivityContext? traceContext) =>
         Create(
             schema, table, captureInstance, after, CdcOperationType.Update,
             before.Values,
             after.Values,
             ComputeMask(capturedColumns, after.UpdateMask),
-            CommitTimeOf(after, timeMap));
+            CommitTimeOf(after, timeMap),
+            traceContext);
 
     private static CdcChange Create(
         string schema,
@@ -133,7 +136,8 @@ internal static class CdcChangePairer
         IReadOnlyDictionary<string, object?> before,
         IReadOnlyDictionary<string, object?> after,
         IReadOnlyDictionary<string, bool> mask,
-        DateTime commitTime) =>
+        DateTime commitTime,
+        System.Diagnostics.ActivityContext? traceContext) =>
         new()
         {
             CaptureInstance = captureInstance,
@@ -149,6 +153,7 @@ internal static class CdcChangePairer
             Before = before,
             After = after,
             UpdateMask = mask,
+            TraceContext = traceContext,
         };
 
     private static IReadOnlyDictionary<string, bool> ComputeMask(IReadOnlyList<string> columns, byte[] mask)

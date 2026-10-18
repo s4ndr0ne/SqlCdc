@@ -18,7 +18,7 @@ public static class SqlCdcServiceCollectionExtensions
     /// <remarks>
     /// The logger and, when registered, the <see cref="ICdcStateStore"/> are taken from the service
     /// provider; anything set inside <paramref name="configure"/> overrides them. Register handlers
-    /// with <see cref="AddCdcChangeHandler{THandler}"/> to have events dispatched automatically,
+    /// with <see cref="AddCdcChangeHandler{THandler}(IServiceCollection)"/> to have events dispatched automatically,
     /// otherwise inject <see cref="SqlCdcWatcher"/> and read its <see cref="SqlCdcWatcher.Changes"/>.
     /// </remarks>
     public static IServiceCollection AddSqlCdc(this IServiceCollection services, Action<SqlCdcWatcherBuilder> configure)
@@ -140,6 +140,45 @@ public static class SqlCdcServiceCollectionExtensions
     }
 
     /// <summary>
+    /// Registers a scoped <see cref="ICdcChangeHandler"/> that only receives changes from the specified table.
+    /// </summary>
+    public static IServiceCollection AddCdcChangeHandler<THandler>(
+        this IServiceCollection services,
+        string? schema,
+        string table)
+        where THandler : class, ICdcChangeHandler
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentException.ThrowIfNullOrWhiteSpace(table);
+
+        services.AddScoped<THandler>();
+        services.AddScoped<ICdcChangeHandler>(sp =>
+            new TableBoundChangeHandler<THandler>(sp.GetRequiredService<THandler>(), schema, table));
+        return services;
+    }
+
+    /// <summary>
+    /// Registers a scoped <see cref="ICdcChangeHandler"/> that only receives changes from the specified table in any schema.
+    /// </summary>
+    public static IServiceCollection AddCdcChangeHandler<THandler>(
+        this IServiceCollection services,
+        string table)
+        where THandler : class, ICdcChangeHandler =>
+        AddCdcChangeHandler<THandler>(services, schema: null, table);
+
+    /// <summary>
+    /// Registers a scoped <see cref="ICdcBatchChangeHandler"/>. Registered batch handlers receive
+    /// batches of changes together.
+    /// </summary>
+    public static IServiceCollection AddCdcBatchChangeHandler<THandler>(this IServiceCollection services)
+        where THandler : class, ICdcBatchChangeHandler
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        services.AddScoped<ICdcBatchChangeHandler, THandler>();
+        return services;
+    }
+
+    /// <summary>
     /// Registers where changes go when a handler has used up its attempts. Without a sink they are
     /// logged and dropped. Pair it with <see cref="SqlCdcWatcherBuilder.WithHandlerRetry"/>.
     /// </summary>
@@ -160,4 +199,23 @@ public static class SqlCdcServiceCollectionExtensions
         services.TryAddSingleton(sink);
         return services;
     }
+}
+
+internal sealed class TableBoundChangeHandler<THandler> : ICdcTableChangeHandler
+    where THandler : class, ICdcChangeHandler
+{
+    private readonly THandler _inner;
+
+    public TableBoundChangeHandler(THandler inner, string? schema, string table)
+    {
+        _inner = inner;
+        SourceSchema = schema;
+        SourceTable = table;
+    }
+
+    public string? SourceSchema { get; }
+    public string SourceTable { get; }
+
+    public Task HandleAsync(CdcChange change, CancellationToken cancellationToken = default) =>
+        _inner.HandleAsync(change, cancellationToken);
 }

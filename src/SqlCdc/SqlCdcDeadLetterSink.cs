@@ -125,6 +125,83 @@ public sealed class SqlCdcDeadLetterSink : ICdcDeadLetterSink
     }
 
     /// <summary>
+    /// Reads dead-letter records from the table, ordered by Id ascending.
+    /// </summary>
+    public async Task<IReadOnlyList<CdcDeadLetterRecord>> ReadAsync(
+        int maxCount = 100,
+        CancellationToken cancellationToken = default)
+    {
+        if (maxCount <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxCount), "Max count must be positive.");
+        }
+
+        await EnsureTableAsync(cancellationToken);
+        await using var conn = await _connections.OpenConnectionAsync(cancellationToken);
+        var sql =
+            $"""
+             SELECT TOP (@top)
+                 Id, CaptureInstance, SourceSchema, SourceTable, Operation, ChangeKey,
+                 CommitTime, Payload, HandlerName, Attempts, Error, FailedAt
+             FROM {TableName}
+             ORDER BY Id ASC;
+             """;
+
+        await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = _commandTimeoutSeconds };
+        cmd.Parameters.Add("@top", SqlDbType.Int).Value = maxCount;
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        var list = new List<CdcDeadLetterRecord>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            list.Add(new CdcDeadLetterRecord(
+                reader.GetInt64(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.GetString(5),
+                await reader.IsDBNullAsync(6, cancellationToken) ? null : reader.GetDateTime(6),
+                await reader.IsDBNullAsync(7, cancellationToken) ? null : reader.GetString(7),
+                reader.GetString(8),
+                reader.GetInt32(9),
+                await reader.IsDBNullAsync(10, cancellationToken) ? null : reader.GetString(10),
+                reader.GetDateTime(11)));
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    /// Deletes a dead-letter entry by its database Id. Returns true if a record was deleted.
+    /// </summary>
+    public async Task<bool> DeleteAsync(long id, CancellationToken cancellationToken = default)
+    {
+        await EnsureTableAsync(cancellationToken);
+        await using var conn = await _connections.OpenConnectionAsync(cancellationToken);
+        var sql = $"DELETE FROM {TableName} WHERE Id = @id;";
+        await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = _commandTimeoutSeconds };
+        cmd.Parameters.Add("@id", SqlDbType.BigInt).Value = id;
+        var rows = await cmd.ExecuteNonQueryAsync(cancellationToken);
+        return rows > 0;
+    }
+
+    /// <summary>
+    /// Deletes dead-letter entries for a specific change key. Returns the number of deleted records.
+    /// </summary>
+    public async Task<int> DeleteAsync(string changeKey, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(changeKey);
+
+        await EnsureTableAsync(cancellationToken);
+        await using var conn = await _connections.OpenConnectionAsync(cancellationToken);
+        var sql = $"DELETE FROM {TableName} WHERE ChangeKey = @key;";
+        await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = _commandTimeoutSeconds };
+        cmd.Parameters.AddWithValue("@key", changeKey);
+        return await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    /// <summary>
     /// Errors that mean the table's existence changed between EnsureTableAsync and the statement:
     /// 208 (missing/dropped since last ensured) and 2714 (already exists, from a concurrent
     /// first use). Both self-heal on the next iteration.
@@ -272,3 +349,20 @@ public sealed class SqlCdcDeadLetterSink : ICdcDeadLetterSink
         }
     }
 }
+
+/// <summary>
+/// A dead-letter record persisted in the SQL dead-letter table.
+/// </summary>
+public sealed record CdcDeadLetterRecord(
+    long Id,
+    string CaptureInstance,
+    string SourceSchema,
+    string SourceTable,
+    string Operation,
+    string ChangeKey,
+    DateTime? CommitTime,
+    string? Payload,
+    string HandlerName,
+    int Attempts,
+    string? Error,
+    DateTime FailedAt);

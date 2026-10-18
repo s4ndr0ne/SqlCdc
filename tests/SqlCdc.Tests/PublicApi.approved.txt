@@ -14,8 +14,13 @@ namespace SqlCdc
         public required string SourceTable { get; init; }
         public required byte[] StartLsn { get; init; }
         public string TableName { get; }
+        public System.Diagnostics.ActivityContext? TraceContext { get; init; }
         public required System.Collections.Generic.IReadOnlyDictionary<string, bool> UpdateMask { get; init; }
         public void Acknowledge() { }
+        public T? GetAfter<T>()
+            where T :  class, new () { }
+        public T? GetBefore<T>()
+            where T :  class, new () { }
     }
     public enum CdcCheckpointMode
     {
@@ -31,6 +36,22 @@ namespace SqlCdc
         public System.DateTimeOffset FailedAt { get; init; }
         public string HandlerName { get; init; }
     }
+    public sealed class CdcDeadLetterRecord : System.IEquatable<SqlCdc.CdcDeadLetterRecord>
+    {
+        public CdcDeadLetterRecord(long Id, string CaptureInstance, string SourceSchema, string SourceTable, string Operation, string ChangeKey, System.DateTime? CommitTime, string? Payload, string HandlerName, int Attempts, string? Error, System.DateTime FailedAt) { }
+        public int Attempts { get; init; }
+        public string CaptureInstance { get; init; }
+        public string ChangeKey { get; init; }
+        public System.DateTime? CommitTime { get; init; }
+        public string? Error { get; init; }
+        public System.DateTime FailedAt { get; init; }
+        public string HandlerName { get; init; }
+        public long Id { get; init; }
+        public string Operation { get; init; }
+        public string? Payload { get; init; }
+        public string SourceSchema { get; init; }
+        public string SourceTable { get; init; }
+    }
     public enum CdcOperationType
     {
         Insert = 2,
@@ -42,10 +63,19 @@ namespace SqlCdc
         FromNow = 0,
         FromBeginning = 1,
     }
+    [System.AttributeUsage(System.AttributeTargets.Class, AllowMultiple=true, Inherited=true)]
+    public sealed class CdcTableAttribute : System.Attribute
+    {
+        public CdcTableAttribute(string table) { }
+        public CdcTableAttribute(string schema, string table) { }
+        public string? Schema { get; }
+        public string Table { get; }
+    }
     public sealed class CdcTableConfiguration
     {
         public CdcTableConfiguration() { }
         public string? CaptureInstance { get; set; }
+        public System.Collections.Generic.IList<string>? Columns { get; set; }
         public string Schema { get; set; }
         public string? Table { get; set; }
     }
@@ -64,7 +94,9 @@ namespace SqlCdc
     public sealed class CdcTableSubscription : System.IEquatable<SqlCdc.CdcTableSubscription>
     {
         public CdcTableSubscription(string Schema, string Table, string? CaptureInstance = null) { }
+        public CdcTableSubscription(string Schema, string Table, string? CaptureInstance, System.Collections.Generic.IReadOnlyList<string>? Columns) { }
         public string? CaptureInstance { get; init; }
+        public System.Collections.Generic.IReadOnlyList<string>? Columns { get; init; }
         public string Schema { get; init; }
         public string Table { get; init; }
     }
@@ -79,6 +111,7 @@ namespace SqlCdc
         public System.TimeSpan HandlerRetryDelay { get; set; }
         public System.TimeSpan LeaseKeepaliveInterval { get; set; }
         public System.TimeSpan LeaseRetryDelay { get; set; }
+        public int? MaxBatchesPerTablePerPoll { get; set; }
         public int MaxHandlerAttempts { get; set; }
         public string Name { get; set; }
         public System.TimeSpan PollInterval { get; set; }
@@ -98,6 +131,10 @@ namespace SqlCdc
         public System.DateTimeOffset? StandbySince { get; init; }
         public System.Collections.Generic.IReadOnlyList<SqlCdc.CdcTableStatus> Tables { get; init; }
         public System.TimeSpan? TimeInStandby { get; }
+    }
+    public interface ICdcBatchChangeHandler
+    {
+        System.Threading.Tasks.Task HandleBatchAsync(System.Collections.Generic.IReadOnlyList<SqlCdc.CdcChange> changes, System.Threading.CancellationToken cancellationToken = default);
     }
     public interface ICdcChangeHandler
     {
@@ -121,6 +158,11 @@ namespace SqlCdc
     {
         System.Threading.Tasks.Task<byte[]?> GetLastLsnAsync(string captureInstance, System.Threading.CancellationToken cancellationToken = default);
         System.Threading.Tasks.Task SaveLastLsnAsync(string captureInstance, byte[] lsn, System.Threading.CancellationToken cancellationToken = default);
+    }
+    public interface ICdcTableChangeHandler : SqlCdc.ICdcChangeHandler
+    {
+        string? SourceSchema { get; }
+        string SourceTable { get; }
     }
     public sealed class InMemoryCdcStateStore : SqlCdc.ICdcStateStore
     {
@@ -151,6 +193,7 @@ namespace SqlCdc
         public System.TimeSpan? LeaseKeepaliveInterval { get; set; }
         public string? LeaseName { get; set; }
         public System.TimeSpan? LeaseRetryDelay { get; set; }
+        public int? MaxBatchesPerTablePerPoll { get; set; }
         public int? MaxHandlerAttempts { get; set; }
         public string? Name { get; set; }
         public System.TimeSpan? PollInterval { get; set; }
@@ -170,6 +213,9 @@ namespace SqlCdc
     {
         public SqlCdcDeadLetterSink(SqlCdc.ICdcConnectionFactory connections, string schema = "dbo", string table = "cdc_dead_letter", bool createTableIfMissing = true, System.TimeSpan? commandTimeout = default) { }
         public SqlCdcDeadLetterSink(string connectionString, string schema = "dbo", string table = "cdc_dead_letter", bool createTableIfMissing = true, System.TimeSpan? commandTimeout = default) { }
+        public System.Threading.Tasks.Task<bool> DeleteAsync(long id, System.Threading.CancellationToken cancellationToken = default) { }
+        public System.Threading.Tasks.Task<int> DeleteAsync(string changeKey, System.Threading.CancellationToken cancellationToken = default) { }
+        public System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<SqlCdc.CdcDeadLetterRecord>> ReadAsync(int maxCount = 100, System.Threading.CancellationToken cancellationToken = default) { }
         public System.Threading.Tasks.Task WriteAsync(SqlCdc.CdcDeadLetter deadLetter, System.Threading.CancellationToken cancellationToken = default) { }
     }
     public static class SqlCdcDiagnostics
@@ -235,6 +281,7 @@ namespace SqlCdc
         public SqlCdc.SqlCdcWatcherBuilder UseSingleActiveInstance(string? leaseName = null) { }
         public SqlCdc.SqlCdcWatcherBuilder UseStateStore(SqlCdc.ICdcStateStore stateStore) { }
         public SqlCdc.SqlCdcWatcherBuilder WatchTable(string schema, string table, string? captureInstance = null) { }
+        public SqlCdc.SqlCdcWatcherBuilder WatchTable(string schema, string table, string? captureInstance, System.Collections.Generic.IReadOnlyList<string>? columns) { }
         public SqlCdc.SqlCdcWatcherBuilder WatchTables([System.Runtime.CompilerServices.TupleElementNames(new string[] {
                 "Schema",
                 "Table"})] params System.ValueTuple<string, string>[] tables) { }
@@ -245,6 +292,7 @@ namespace SqlCdc
         public SqlCdc.SqlCdcWatcherBuilder WithHandlerRetry(int maxAttempts, System.TimeSpan? retryDelay = default) { }
         public SqlCdc.SqlCdcWatcherBuilder WithLeaseKeepaliveInterval(System.TimeSpan leaseKeepaliveInterval) { }
         public SqlCdc.SqlCdcWatcherBuilder WithLeaseRetryDelay(System.TimeSpan leaseRetryDelay) { }
+        public SqlCdc.SqlCdcWatcherBuilder WithMaxBatchesPerTablePerPoll(int maxBatches) { }
         public SqlCdc.SqlCdcWatcherBuilder WithName(string name) { }
         public SqlCdc.SqlCdcWatcherBuilder WithPollInterval(System.TimeSpan pollInterval) { }
         public SqlCdc.SqlCdcWatcherBuilder WithRetryDelay(System.TimeSpan retryDelay) { }

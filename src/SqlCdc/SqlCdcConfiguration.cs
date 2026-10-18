@@ -65,6 +65,9 @@ public sealed class SqlCdcConfiguration
     /// <summary>Delay before the second handler attempt.</summary>
     public TimeSpan? HandlerRetryDelay { get; set; }
 
+    /// <summary>Maximum batches pulled per table in a single polling cycle.</summary>
+    public int? MaxBatchesPerTablePerPoll { get; set; }
+
     /// <summary>
     /// Applies everything that was actually configured to a builder. Nothing is validated here:
     /// configuration and code are meant to be mixed, so a setting missing from one may well be
@@ -92,7 +95,11 @@ public sealed class SqlCdcConfiguration
                     "A watched table is missing its 'Table' name in the SqlCdc configuration section.");
             }
 
-            builder.WatchTable(table.Schema, table.Table, table.CaptureInstance);
+            builder.WatchTable(
+                table.Schema,
+                table.Table,
+                table.CaptureInstance,
+                table.Columns is null ? null : table.Columns.ToList());
         }
 
         if (PollInterval is { } pollInterval)
@@ -103,6 +110,11 @@ public sealed class SqlCdcConfiguration
         if (BatchSize is { } batchSize)
         {
             builder.WithBatchSize(batchSize);
+        }
+
+        if (MaxBatchesPerTablePerPoll is { } maxBatches)
+        {
+            builder.WithMaxBatchesPerTablePerPoll(maxBatches);
         }
 
         if (ChannelCapacity is { } channelCapacity)
@@ -171,4 +183,7 @@ public sealed class CdcTableConfiguration
 
     /// <summary>Capture instance to read, when the table has more than the default one.</summary>
     public string? CaptureInstance { get; set; }
+
+    /// <summary>Explicit columns to select. Null selects all columns.</summary>
+    public IList<string>? Columns { get; set; }
 }

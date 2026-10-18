@@ -18,6 +18,8 @@ internal sealed class SqlCdcHostedService : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<SqlCdcHostedService> _logger;
     private readonly ICdcDeadLetterSink? _deadLetterSink;
+    private readonly bool _hasHandlers;
+    private readonly bool _hasBatchHandlers;
 
     public SqlCdcHostedService(
         SqlCdcWatcher watcher,
@@ -32,8 +34,9 @@ internal sealed class SqlCdcHostedService : BackgroundService
 
         // Checked here rather than in ExecuteAsync so the host fails to start with this exception
         // in hand, instead of starting and then stopping itself from a background failure.
-        _hasHandlers = HasHandlers();
-        if (_hasHandlers && _deadLetterSink is null)
+        _hasHandlers = HasSingleHandlers();
+        _hasBatchHandlers = HasBatchHandlers();
+        if ((_hasHandlers || _hasBatchHandlers) && _deadLetterSink is null)
         {
             throw new InvalidOperationException(
                 "CDC handlers are registered but no ICdcDeadLetterSink is configured. A handler that fails has " +
@@ -41,8 +44,6 @@ internal sealed class SqlCdcHostedService : BackgroundService
                 "Register one with AddCdcDeadLetterSink(...), for example new SqlCdcDeadLetterSink(connectionString).");
         }
     }
-
-    private readonly bool _hasHandlers;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -55,7 +56,7 @@ internal sealed class SqlCdcHostedService : BackgroundService
             return;
         }
 
-        if (!_hasHandlers)
+        if (!_hasHandlers && !_hasBatchHandlers)
         {
             // No handlers registered: the application reads SqlCdcWatcher.Changes itself.
             _logger.LogInformation("No CDC handlers are registered; leaving channel consumption to the application.");
@@ -75,7 +76,22 @@ internal sealed class SqlCdcHostedService : BackgroundService
             try
             {
                 // Re-evaluated on every iteration: a restarted watcher delivers on a new channel.
-                if (_hasHandlers)
+                if (_hasBatchHandlers)
+                {
+                    var batch = new List<CdcChange>();
+                    await foreach (var change in _watcher.Changes.WithCancellation(stoppingToken))
+                    {
+                        batch.Add(change);
+                        while (batch.Count < _watcher.Options.BatchSize && _watcher.Channel.Reader.TryRead(out var nextChange))
+                        {
+                            batch.Add(nextChange);
+                        }
+
+                        await DispatchBatchAsync(batch, stoppingToken);
+                        batch.Clear();
+                    }
+                }
+                else if (_hasHandlers)
                 {
                     await foreach (var change in _watcher.Changes.WithCancellation(stoppingToken))
                     {
@@ -168,10 +184,55 @@ internal sealed class SqlCdcHostedService : BackgroundService
         }
     }
 
-    private bool HasHandlers()
+    private bool HasSingleHandlers()
     {
         using var scope = _scopeFactory.CreateScope();
         return scope.ServiceProvider.GetServices<ICdcChangeHandler>().Any();
+    }
+
+    private bool HasBatchHandlers()
+    {
+        using var scope = _scopeFactory.CreateScope();
+        return scope.ServiceProvider.GetServices<ICdcBatchChangeHandler>().Any();
+    }
+
+    private static bool HandlerMatches(ICdcChangeHandler handler, CdcChange change)
+    {
+        if (handler is ICdcTableChangeHandler tableHandler)
+        {
+            if (!string.Equals(tableHandler.SourceTable, change.SourceTable, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (tableHandler.SourceSchema is not null &&
+                !string.Equals(tableHandler.SourceSchema, change.SourceSchema, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        var tableAttrs = handler.GetType().GetCustomAttributes(typeof(CdcTableAttribute), inherit: true);
+        if (tableAttrs.Length > 0)
+        {
+            var matches = false;
+            foreach (CdcTableAttribute attr in tableAttrs)
+            {
+                if (string.Equals(attr.Table, change.SourceTable, StringComparison.OrdinalIgnoreCase) &&
+                    (attr.Schema is null || string.Equals(attr.Schema, change.SourceSchema, StringComparison.OrdinalIgnoreCase)))
+                {
+                    matches = true;
+                    break;
+                }
+            }
+
+            if (!matches)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private async Task DispatchAsync(CdcChange change, CancellationToken ct)
@@ -180,12 +241,107 @@ internal sealed class SqlCdcHostedService : BackgroundService
         var handlers = scope.ServiceProvider.GetServices<ICdcChangeHandler>().ToList();
         for (var i = 0; i < handlers.Count; i++)
         {
-            await InvokeHandlerAsync(handlers[i], i, change, ct);
+            if (HandlerMatches(handlers[i], change))
+            {
+                await InvokeHandlerAsync(handlers[i], i, change, ct);
+            }
         }
 
         // Acknowledged only after every handler has been given the change, and never on
         // cancellation (which rethrows below), so a shutdown mid-batch replays it on restart.
         change.Acknowledge();
+    }
+
+    private async Task DispatchBatchAsync(IReadOnlyList<CdcChange> batch, CancellationToken ct)
+    {
+        using var scope = _scopeFactory.CreateScope();
+
+        if (_hasHandlers)
+        {
+            var singleHandlers = scope.ServiceProvider.GetServices<ICdcChangeHandler>().ToList();
+            foreach (var change in batch)
+            {
+                for (var i = 0; i < singleHandlers.Count; i++)
+                {
+                    if (HandlerMatches(singleHandlers[i], change))
+                    {
+                        await InvokeHandlerAsync(singleHandlers[i], i, change, ct);
+                    }
+                }
+            }
+        }
+
+        var batchHandlers = scope.ServiceProvider.GetServices<ICdcBatchChangeHandler>().ToList();
+        for (var i = 0; i < batchHandlers.Count; i++)
+        {
+            await InvokeBatchHandlerAsync(batchHandlers[i], i, batch, ct);
+        }
+
+        foreach (var change in batch)
+        {
+            change.Acknowledge();
+        }
+    }
+
+    private async Task InvokeBatchHandlerAsync(
+        ICdcBatchChangeHandler initialHandler, int handlerIndex, IReadOnlyList<CdcChange> batch, CancellationToken ct)
+    {
+        var handler = initialHandler;
+        var handlerName = handler.GetType().Name;
+        var maxAttempts = _watcher.Options.MaxHandlerAttempts;
+        IServiceScope? retryScope = null;
+
+        try
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    await handler.HandleBatchAsync(batch, ct);
+                    return;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    var willRetry = attempt < maxAttempts;
+                    if (willRetry)
+                    {
+                        var delay = BackoffFor(attempt);
+                        _logger.LogWarning(
+                            ex,
+                            "Batch handler {Handler} failed for batch of {Count} changes (attempt {Attempt} of {MaxAttempts}); retrying in {RetryDelay}",
+                            handlerName, batch.Count, attempt, maxAttempts, delay);
+
+                        await Task.Delay(delay, ct);
+
+                        retryScope?.Dispose();
+                        retryScope = _scopeFactory.CreateScope();
+                        handler = retryScope.ServiceProvider.GetServices<ICdcBatchChangeHandler>().ElementAt(handlerIndex);
+                        continue;
+                    }
+
+                    _logger.LogError(
+                        ex,
+                        "Batch handler {Handler} failed for batch of {Count} changes after {Attempts} attempt(s); dead-lettering changes",
+                        handlerName, batch.Count, attempt);
+
+                    foreach (var change in batch)
+                    {
+                        await DeadLetterAsync(
+                            new CdcDeadLetter(change, handlerName, attempt, ex, DateTimeOffset.UtcNow), ct);
+                    }
+
+                    return;
+                }
+            }
+        }
+        finally
+        {
+            retryScope?.Dispose();
+        }
     }
 
     /// <summary>
@@ -197,7 +353,9 @@ internal sealed class SqlCdcHostedService : BackgroundService
         ICdcChangeHandler initialHandler, int handlerIndex, CdcChange change, CancellationToken ct)
     {
         var handler = initialHandler;
-        var handlerName = handler.GetType().Name;
+        var handlerName = handler.GetType().IsGenericType
+            ? handler.GetType().GetGenericArguments()[0].Name
+            : handler.GetType().Name;
         var maxAttempts = _watcher.Options.MaxHandlerAttempts;
         IServiceScope? retryScope = null;
 
@@ -205,8 +363,12 @@ internal sealed class SqlCdcHostedService : BackgroundService
         {
             for (var attempt = 1; ; attempt++)
             {
+                ActivityLink[]? links = change.TraceContext is { } tc
+                    ? [new ActivityLink(tc)]
+                    : null;
+
                 using var activity = SqlCdcDiagnostics.ActivitySource.StartActivity(
-                    "SqlCdc.Handle", ActivityKind.Consumer);
+                    "SqlCdc.Handle", ActivityKind.Consumer, parentContext: default, tags: null, links: links);
                 activity?.SetTag("watcher", _watcher.Name);
                 activity?.SetTag("capture_instance", change.CaptureInstance);
                 activity?.SetTag("table", change.TableName);

@@ -6,7 +6,22 @@ namespace SqlCdc;
 public sealed record CdcTableSubscription(
     string Schema,
     string Table,
-    string? CaptureInstance = null);
+    string? CaptureInstance = null)
+{
+    /// <summary>
+    /// Explicit column projection. When null or empty, all captured columns are selected.
+    /// </summary>
+    public IReadOnlyList<string>? Columns { get; init; }
+
+    /// <summary>
+    /// Creates a subscription for a table with explicit column projection.
+    /// </summary>
+    public CdcTableSubscription(string Schema, string Table, string? CaptureInstance, IReadOnlyList<string>? Columns)
+        : this(Schema, Table, CaptureInstance)
+    {
+        this.Columns = Columns;
+    }
+}
 
 /// <summary>
 /// Where to start processing when no stored watermark LSN exists yet.
@@ -90,4 +105,11 @@ public sealed class CdcWatcherOptions
     /// one minute. Defaults to 1 second. Only used when <see cref="MaxHandlerAttempts"/> is above 1.
     /// </summary>
     public TimeSpan HandlerRetryDelay { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Maximum batches of changes pulled from a single table in one polling cycle before moving
+    /// to the next table. Prevents a table with a large backlog from starving other tables.
+    /// <c>null</c> means no limit (drains the table backlog completely). Defaults to <c>null</c>.
+    /// </summary>
+    public int? MaxBatchesPerTablePerPoll { get; set; }
 }

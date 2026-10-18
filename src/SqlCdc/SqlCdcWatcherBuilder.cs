@@ -33,6 +33,7 @@ public sealed class SqlCdcWatcherBuilder
     private string _name = "default";
     private int _maxHandlerAttempts = 1;
     private TimeSpan _handlerRetryDelay = TimeSpan.FromSeconds(1);
+    private int? _maxBatchesPerTablePerPoll;
 
     private SqlCdcWatcherBuilder()
     {
@@ -49,6 +50,16 @@ public sealed class SqlCdcWatcherBuilder
     public SqlCdcWatcherBuilder WatchTable(string schema, string table, string? captureInstance = null)
     {
         _tables.Add(new CdcTableSubscription(schema, table, captureInstance));
+        return this;
+    }
+
+    public SqlCdcWatcherBuilder WatchTable(
+        string schema,
+        string table,
+        string? captureInstance,
+        IReadOnlyList<string>? columns)
+    {
+        _tables.Add(new CdcTableSubscription(schema, table, captureInstance, columns));
         return this;
     }
 
@@ -93,6 +104,21 @@ public sealed class SqlCdcWatcherBuilder
         }
 
         _batchSize = batchSize;
+        return this;
+    }
+
+    /// <summary>
+    /// Sets the maximum number of batches read from a single table in a single polling cycle.
+    /// Prevents a table with a large backlog from starving other tables.
+    /// </summary>
+    public SqlCdcWatcherBuilder WithMaxBatchesPerTablePerPoll(int maxBatches)
+    {
+        if (maxBatches <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxBatches), "Max batches per table must be positive.");
+        }
+
+        _maxBatchesPerTablePerPoll = maxBatches;
         return this;
     }
 
@@ -340,6 +366,7 @@ public sealed class SqlCdcWatcherBuilder
             Name = _name,
             MaxHandlerAttempts = _maxHandlerAttempts,
             HandlerRetryDelay = _handlerRetryDelay,
+            MaxBatchesPerTablePerPoll = _maxBatchesPerTablePerPoll,
         };
 
         var connections = _connectionFactory

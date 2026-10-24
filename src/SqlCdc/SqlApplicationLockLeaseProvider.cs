@@ -208,10 +208,18 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
             {
                 throw;
             }
-            catch (Exception ex)
+            catch (SqlException ex)
             {
                 // The lease lives on this connection: if it is unusable the lease is gone, whatever
                 // the reason. Reporting it as lost is what lets another instance take over.
+                _logger.LogWarning(ex, "The connection holding the application lock {Resource} failed", _resource);
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.LogWarning(ex, "The connection holding the application lock {Resource} failed", _resource);
+            }
+            catch (ObjectDisposedException ex)
+            {
                 _logger.LogWarning(ex, "The connection holding the application lock {Resource} failed", _resource);
             }
 

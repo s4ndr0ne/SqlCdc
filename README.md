@@ -77,10 +77,13 @@ work (resolving capture instances); cancelling it later does not stop the watche
 ```csharp
 builder.Services.AddSqlCdc(cdc => cdc
     .UseConnectionString(connectionString)
-    .WatchTable("dbo", "Orders")
+    .WatchTable("dbo", "Orders", columns: ["Id", "Status", "Total"])
+    .WatchTable("dbo", "Customers")
     .UseStateStore(new SqlCdcStateStore(connectionString)));
 
-builder.Services.AddCdcChangeHandler<OrderChangedHandler>();
+// Handlers can be global, table-specific, or batch-oriented:
+builder.Services.AddCdcChangeHandler<OrderChangedHandler>("dbo", "Orders");
+builder.Services.AddCdcBatchChangeHandler<AuditBatchHandler>();
 builder.Services.AddCdcDeadLetterSink(new SqlCdcDeadLetterSink(connectionString));
 ```
 
@@ -89,18 +92,30 @@ with the host and stops it on shutdown. The logger and `ICdcStateStore` are reso
 the container when available; settings configured inside the delegate take precedence.
 
 ```csharp
+[CdcTable("dbo", "Orders")]
 public sealed class OrderChangedHandler(AppDbContext db) : ICdcChangeHandler
 {
     public async Task HandleAsync(CdcChange change, CancellationToken ct = default)
     {
+        // Strongly-typed mapping from CDC dictionary values:
+        var order = change.GetAfter<OrderDto>();
         // ...
     }
 }
 ```
 
-Each handler is **scoped** and resolved in a dedicated scope per event, so injecting a
-`DbContext` is safe. All registered handlers receive every event in registration order.
-A handler that throws is retried according to `WithHandlerRetry` and then dead-lettered — see
+#### Handler routing and batching
+- **Table-specific routing**: Register with `AddCdcChangeHandler<T>("schema", "table")`, implement
+  `ICdcTableChangeHandler`, or annotate with `[CdcTable("table")]`. Handlers only receive matching events.
+  Plain `ICdcChangeHandler` without filters receives all events.
+- **Batch processing**: Register with `AddCdcBatchChangeHandler<TBatch>()` implementing
+  `ICdcBatchChangeHandler`. Changes currently queued on the channel are grouped up to `BatchSize`
+  and delivered together — ideal for bulk ingestion into Elasticsearch, Kafka, or data warehouses.
+- **Strongly-typed mapping**: Call `change.GetAfter<T>()` or `change.GetBefore<T>()` to automatically
+  map CDC columns into properties/records, handling SQL data types (`Guid`, `DateTime`, `DateOnly`, enums, numerics).
+
+Each handler is **scoped** and resolved in a dedicated scope per event (or batch), so injecting a
+`DbContext` is safe. A handler that throws is retried according to `WithHandlerRetry` and then dead-lettered — see
 [Handler failures](#handler-failures-retry-and-dead-letter-queue).
 
 When no handlers are registered the watcher is still started by the host, and restarted if its
@@ -121,11 +136,12 @@ builder.Services.AddSqlCdc(builder.Configuration.GetSection("SqlCdc"));
     "ConnectionString": "Server=.;Database=Sales;Authentication=Active Directory Default;Encrypt=True",
     "Name": "sales",
     "Tables": [
-      { "Schema": "dbo", "Table": "Orders" },
+      { "Schema": "dbo", "Table": "Orders", "Columns": ["Id", "Status", "Total"] },
       { "Schema": "dbo", "Table": "Customers", "CaptureInstance": "dbo_Customers_v2" }
     ],
     "PollInterval": "00:00:00.500",
     "BatchSize": 1000,
+    "MaxBatchesPerTablePerPoll": 5,        // fair-sharing: limit consecutive batches per table
     "ChannelCapacity": 100000,
     "StartMode": "FromNow",              // FromNow | FromBeginning
     "CheckpointMode": "OnAcknowledgement", // OnEmit | OnAcknowledgement
@@ -215,6 +231,10 @@ record CdcChange
     IReadOnlyDictionary<string, object?> After;
     IReadOnlyDictionary<string, bool> UpdateMask;  // changed columns (update only)
     string Key;                                     // stable per-change identifier
+    ActivityContext? TraceContext;                  // OpenTelemetry trace correlation
+
+    T? GetAfter<T>() where T : class, new();        // maps After dictionary to typed model
+    T? GetBefore<T>() where T : class, new();       // maps Before dictionary to typed model
 }
 ```
 
@@ -224,6 +244,8 @@ record CdcChange
 |---|---|---|
 | `WithPollInterval` | 500 ms | Polling frequency per capture instance |
 | `WithBatchSize` | 1000 | Rows per cycle per table (soft cap, see below) |
+| `WithMaxBatchesPerTablePerPoll` | `null` (unlimited) | Max batches pulled per table per cycle to prevent starvation |
+| `WatchTable` | — | Watch table with optional capture instance and column projection |
 | `WithChannelCapacity` | 100 000 | Channel capacity (backpressure) |
 | `StartFrom` | `FromNow` | `FromNow` (skip history) or `FromBeginning` |
 | `UseStateStore` | SQL state store | Override the persistent `SqlCdcStateStore` used for the watermark LSN |
@@ -441,6 +463,27 @@ delivery pauses until it succeeds. Under `OnAcknowledgement` the change also sta
 so a restart during the outage replays it; under `OnEmit` it is lost if the process restarts
 before the sink is back.
 
+#### Inspecting and replaying dead letters
+
+`SqlCdcDeadLetterSink` exposes methods to query and purge failed records directly:
+
+```csharp
+var sink = new SqlCdcDeadLetterSink(connectionString);
+
+// Read failed changes ordered by Id
+IReadOnlyList<CdcDeadLetterRecord> records = await sink.ReadAsync(maxCount: 50);
+
+foreach (var record in records)
+{
+    Console.WriteLine($"Dead letter {record.Id}: Table={record.SourceTable}, Handler={record.HandlerName}, Error={record.Error}");
+
+    // Replay logic / manual handling...
+
+    // Delete when processed
+    await sink.DeleteAsync(record.Id);
+}
+```
+
 Registering a handler without a sink fails when the host starts: a failed handler has its change
 acknowledged and the watermark moves past it, so without a sink the change would be gone.
 Retries and dead-lettering apply to handlers registered with `AddCdcChangeHandler`. Code that
@@ -476,7 +519,9 @@ server's *local* time, so comparing it with the client's UTC would measure the t
 offset. It costs no extra round-trip.
 
 Spans: `SqlCdc.Poll` per poll of a capture instance, `SqlCdc.Handle` per handler call (tagged
-with the change key, operation and attempt number).
+with the change key, operation and attempt number). `SqlCdc.Handle` spans include an OpenTelemetry
+`ActivityLink` pointing to the `SqlCdc.Poll` span that emitted the change, enabling end-to-end distributed
+tracing across polling and processing.
 
 ### Health check
 

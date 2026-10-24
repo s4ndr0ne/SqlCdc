@@ -6,6 +6,50 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-10-18
+
+### Added
+
+- **Table-specific change handler routing**:
+  - `[CdcTable("schema", "table")]` attribute to target specific tables declaratively.
+  - `ICdcTableChangeHandler` interface with `TargetSchema` and `TargetTable` properties for dynamic table filtering.
+  - `AddCdcChangeHandler<THandler>("schema", "table")` DI registration overload.
+  - `SqlCdcHostedService` routes CDC changes only to handlers matching the target table, while non-filtered handlers continue to receive all changes.
+- **Batch change handling**:
+  - `ICdcBatchChangeHandler` interface for processing batches of changes (`IReadOnlyList<CdcChange>`).
+  - `AddCdcBatchChangeHandler<TBatchHandler>()` DI registration overload.
+  - Changes currently queued on the channel are grouped up to `BatchSize` and delivered together — ideal for bulk ingestion into Elasticsearch, Kafka, or data warehouses.
+- **Strongly-typed entity mapping on `CdcChange`**:
+  - `change.GetAfter<T>()` and `change.GetBefore<T>()` helper methods to automatically map CDC dictionary values into strongly typed objects or records.
+  - Handles SQL Server data type conversions including `Guid`, `DateTime`, `DateOnly`, `TimeOnly`, enums, numeric conversions, and nullable types.
+- **Column projection for CDC queries**:
+  - `WatchTable("dbo", "Orders", columns: ["Id", "Status", "Total"])` overload on the watcher builder.
+  - `Columns` property on `CdcTableSubscription` and configuration binding (`Tables[].Columns`).
+  - Queries only the requested columns in `cdc.fn_cdc_get_all_changes_...` instead of all columns, reducing database I/O and network payload size.
+- **Table fair-sharing batch throttling**:
+  - `WithMaxBatchesPerTablePerPoll(int)` option (and `MaxBatchesPerTablePerPoll` in configuration).
+  - Limits consecutive batches retrieved per table per polling cycle to prevent high-velocity tables from starving other tables.
+- **Dead-letter queue inspection and replay**:
+  - `SqlCdcDeadLetterSink.ReadAsync(int maxCount, CancellationToken)` to inspect persisted dead-letter entries ordered by `Id`.
+  - `SqlCdcDeadLetterSink.DeleteAsync(long id, CancellationToken)` and `DeleteAsync(string changeKey, CancellationToken)` to purge processed or replayed records.
+  - `CdcDeadLetterRecord` model representing dead-lettered entries.
+- **Distributed trace propagation**:
+  - `CdcChange.TraceContext` exposes the originating poller `ActivityContext`.
+  - Handler execution (`SqlCdc.Handle`) links to the poll span (`SqlCdc.Poll`) via OpenTelemetry `ActivityLink`, establishing end-to-end trace correlation.
+
+### Fixed
+
+- Pinned `System.Security.Cryptography.Pkcs` to `10.0.13` in `Directory.Packages.props` to eliminate security advisories GHSA-846f-f764-76mx and GHSA-2fmv-rv2c-59x7.
+- Added validation in `SqlCdcWatcher` to prevent duplicate capture instance configurations, throwing `InvalidOperationException` at startup.
+
+## [3.1.0] - 2026-09-18
+
+### Fixed
+
+- Resolved code scanning alert regarding SQL connection encryption settings in lease lifecycle test suite.
+
+## [3.0.0] - 2026-09-05
+
 This release changes the defaults towards not losing data. Every one of them can be set back to
 the previous behaviour explicitly; see **Migrating** below.
 
@@ -228,5 +272,8 @@ consumer pinned to `Microsoft.Data.SqlClient` 6.x has to move as well.
 
 First release.
 
+[3.2.0]: https://github.com/s4ndr0ne/SqlCdc/compare/v3.1.0...v3.2.0
+[3.1.0]: https://github.com/s4ndr0ne/SqlCdc/compare/v3.0.0...v3.1.0
+[3.0.0]: https://github.com/s4ndr0ne/SqlCdc/compare/v2.0.0...v3.0.0
 [2.0.0]: https://github.com/s4ndr0ne/SqlCdc/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/s4ndr0ne/SqlCdc/releases/tag/v1.0.0

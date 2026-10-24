@@ -961,9 +961,11 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             cursor = minLsn;
         }
 
+        var batchesRead = 0;
         while (LsnHelpers.Compare(cursor, maxLsn) <= 0)
         {
             var batch = await ReadChangesAsync(conn, table, cursor, maxLsn, ct);
+            batchesRead++;
             if (batch.Rows.Count > 0 && batch.FullyConsumedLsn is not null)
             {
                 SqlCdcDiagnostics.BatchRows.Record(batch.Rows.Count, TableTags(table));
@@ -975,7 +977,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 var emitted = 0;
 
                 foreach (var change in CdcChangePairer.Pair(
-                    table.Schema, table.Table, table.CaptureInstance, table.CapturedColumns, batch.Rows, timeMap, _logger))
+                    table.Schema, table.Table, table.CaptureInstance, table.CapturedColumns, batch.Rows, timeMap, _logger, activity?.Context))
                 {
                     // Registered before the change is written: once it is on the channel a consumer
                     // can acknowledge it at any moment, and the ledger must already know about it.
@@ -1020,6 +1022,11 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             // says, or the poll would spin on the same range.
             if (batch.Rows.Count == 0 || !batch.HitCap || table.Watermark is null
                 || LsnHelpers.Compare(table.Watermark, maxLsn) >= 0)
+            {
+                break;
+            }
+
+            if (_options.MaxBatchesPerTablePerPoll is { } maxBatches && batchesRead >= maxBatches)
             {
                 break;
             }
@@ -1212,7 +1219,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         // One row past the cap: it is what tells a complete last transaction from a cut one.
         var top = batchSize is { } size ? "TOP (@top) " : string.Empty;
         await using var cmd = new SqlCommand(
-            $"SELECT {top}* FROM {functionName}(@from, @to, N'all update old') " +
+            $"SELECT {top}{table.ColumnsToSelect} FROM {functionName}(@from, @to, N'all update old') " +
             "ORDER BY __$start_lsn;", conn);
         cmd.CommandTimeout = CommandTimeoutSeconds;
         cmd.Parameters.Add("@from", SqlDbType.Binary, 10).Value = fromLsn;
@@ -1276,7 +1283,20 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 $"No captured columns found for capture instance '{captureInstance}'.");
         }
 
-        return new TableRuntime(subscription.Schema, subscription.Table, captureInstance, columns);
+        if (subscription.Columns is { Count: > 0 } projected)
+        {
+            foreach (var col in projected)
+            {
+                if (!columns.Contains(col, StringComparer.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"Column '{col}' specified in column projection is not captured in CDC capture instance '{captureInstance}'. " +
+                        $"Available columns: {string.Join(", ", columns)}.");
+                }
+            }
+        }
+
+        return new TableRuntime(subscription.Schema, subscription.Table, captureInstance, columns, subscription.Columns);
     }
 
     /// <summary>
@@ -1501,13 +1521,26 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
     private sealed class TableRuntime
     {
-        public TableRuntime(string schema, string table, string captureInstance, IReadOnlyList<string> capturedColumns)
+        public TableRuntime(
+            string schema,
+            string table,
+            string captureInstance,
+            IReadOnlyList<string> capturedColumns,
+            IReadOnlyList<string>? selectedColumns = null)
         {
             Schema = schema;
             Table = table;
             CaptureInstance = captureInstance;
             CapturedColumns = capturedColumns;
+            SelectedColumns = selectedColumns;
+            ColumnsToSelect = selectedColumns is { Count: > 0 }
+                ? "__$start_lsn, __$seqval, __$operation, __$update_mask, " +
+                  string.Join(", ", selectedColumns.Select(c => SqlIdentifier.Quote(c, nameof(c))))
+                : "*";
         }
+
+        public string ColumnsToSelect { get; }
+        public IReadOnlyList<string>? SelectedColumns { get; }
 
         /// <summary>Changes emitted for this capture instance; read from other threads by GetStatus.</summary>
         public long ChangesEmitted;

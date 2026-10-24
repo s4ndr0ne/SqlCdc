@@ -1217,7 +1217,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         var builder = new ChangeBatchBuilder(batchSize ?? int.MaxValue);
 
         // One row past the cap: it is what tells a complete last transaction from a cut one.
-        var top = batchSize is { } size ? "TOP (@top) " : string.Empty;
+        var top = batchSize is not null ? "TOP (@top) " : string.Empty;
         await using var cmd = new SqlCommand(
             $"SELECT {top}{table.ColumnsToSelect} FROM {functionName}(@from, @to, N'all update old') " +
             "ORDER BY __$start_lsn;", conn);

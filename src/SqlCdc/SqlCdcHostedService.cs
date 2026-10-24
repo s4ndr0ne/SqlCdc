@@ -289,12 +289,17 @@ internal sealed class SqlCdcHostedService : BackgroundService
         var handler = initialHandler;
         var handlerName = handler.GetType().Name;
         var maxAttempts = _watcher.Options.MaxHandlerAttempts;
-        IServiceScope? retryScope = null;
 
-        try
+        for (var attempt = 1; ; attempt++)
         {
-            for (var attempt = 1; ; attempt++)
+            Exception? failure = null;
+            using (var retryScope = attempt == 1 ? null : _scopeFactory.CreateScope())
             {
+                if (retryScope is not null)
+                {
+                    handler = retryScope.ServiceProvider.GetServices<ICdcBatchChangeHandler>().ElementAt(handlerIndex);
+                }
+
                 try
                 {
                     await handler.HandleBatchAsync(batch, ct);
@@ -306,41 +311,40 @@ internal sealed class SqlCdcHostedService : BackgroundService
                 }
                 catch (Exception ex)
                 {
-                    var willRetry = attempt < maxAttempts;
-                    if (willRetry)
-                    {
-                        var delay = BackoffFor(attempt);
-                        _logger.LogWarning(
-                            ex,
-                            "Batch handler {Handler} failed for batch of {Count} changes (attempt {Attempt} of {MaxAttempts}); retrying in {RetryDelay}",
-                            handlerName, batch.Count, attempt, maxAttempts, delay);
-
-                        await Task.Delay(delay, ct);
-
-                        retryScope?.Dispose();
-                        retryScope = _scopeFactory.CreateScope();
-                        handler = retryScope.ServiceProvider.GetServices<ICdcBatchChangeHandler>().ElementAt(handlerIndex);
-                        continue;
-                    }
-
-                    _logger.LogError(
-                        ex,
-                        "Batch handler {Handler} failed for batch of {Count} changes after {Attempts} attempt(s); dead-lettering changes",
-                        handlerName, batch.Count, attempt);
-
-                    foreach (var change in batch)
-                    {
-                        await DeadLetterAsync(
-                            new CdcDeadLetter(change, handlerName, attempt, ex, DateTimeOffset.UtcNow), ct);
-                    }
-
-                    return;
+                    failure = ex;
                 }
             }
-        }
-        finally
-        {
-            retryScope?.Dispose();
+
+            if (failure is null)
+            {
+                return;
+            }
+
+            var willRetry = attempt < maxAttempts;
+            if (willRetry)
+            {
+                var delay = BackoffFor(attempt);
+                _logger.LogWarning(
+                    failure,
+                    "Batch handler {Handler} failed for batch of {Count} changes (attempt {Attempt} of {MaxAttempts}); retrying in {RetryDelay}",
+                    handlerName, batch.Count, attempt, maxAttempts, delay);
+
+                await Task.Delay(delay, ct);
+                continue;
+            }
+
+            _logger.LogError(
+                failure,
+                "Batch handler {Handler} failed for batch of {Count} changes after {Attempts} attempt(s); dead-lettering changes",
+                handlerName, batch.Count, attempt);
+
+            foreach (var change in batch)
+            {
+                await DeadLetterAsync(
+                    new CdcDeadLetter(change, handlerName, attempt, failure, DateTimeOffset.UtcNow), ct);
+            }
+
+            return;
         }
     }
 
@@ -357,12 +361,17 @@ internal sealed class SqlCdcHostedService : BackgroundService
             ? handler.GetType().GetGenericArguments()[0].Name
             : handler.GetType().Name;
         var maxAttempts = _watcher.Options.MaxHandlerAttempts;
-        IServiceScope? retryScope = null;
 
-        try
+        for (var attempt = 1; ; attempt++)
         {
-            for (var attempt = 1; ; attempt++)
+            Exception? failure = null;
+            using (var retryScope = attempt == 1 ? null : _scopeFactory.CreateScope())
             {
+                if (retryScope is not null)
+                {
+                    handler = retryScope.ServiceProvider.GetServices<ICdcChangeHandler>().ElementAt(handlerIndex);
+                }
+
                 ActivityLink[]? links = change.TraceContext is { } tc
                     ? [new ActivityLink(tc)]
                     : null;
@@ -390,46 +399,43 @@ internal sealed class SqlCdcHostedService : BackgroundService
                 }
                 catch (Exception ex)
                 {
-                    var willRetry = attempt < maxAttempts;
+                    failure = ex;
+                    var attemptWillRetry = attempt < maxAttempts;
                     activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
-                    RecordHandlerDuration(handlerName, change, willRetry ? "retry" : "failed", startedAt);
+                    RecordHandlerDuration(handlerName, change, attemptWillRetry ? "retry" : "failed", startedAt);
                     SqlCdcDiagnostics.HandlerFailures.Add(1, HandlerTags(handlerName, change));
-
-                    if (willRetry)
-                    {
-                        var delay = BackoffFor(attempt);
-                        _logger.LogWarning(
-                            ex,
-                            "Handler {Handler} failed for change {ChangeKey} on {TableName} " +
-                            "(attempt {Attempt} of {MaxAttempts}); retrying in {RetryDelay}",
-                            handlerName, change.Key, change.TableName, attempt, maxAttempts, delay);
-
-                        await Task.Delay(delay, ct);
-
-                        // Scoped dependencies (such as an EF Core DbContext) may be left corrupted
-                        // after a failure. Create a fresh scope for each retry attempt.
-                        retryScope?.Dispose();
-                        retryScope = _scopeFactory.CreateScope();
-                        handler = retryScope.ServiceProvider.GetServices<ICdcChangeHandler>().ElementAt(handlerIndex);
-                        continue;
-                    }
-
-                    _logger.LogError(
-                        ex,
-                        "Handler {Handler} failed for change {ChangeKey} on {TableName} after {Attempts} attempt(s); " +
-                        "the event is {Outcome}",
-                        handlerName, change.Key, change.TableName, attempt,
-                        _deadLetterSink is null ? "dropped" : "dead-lettered");
-
-                    await DeadLetterAsync(
-                        new CdcDeadLetter(change, handlerName, attempt, ex, DateTimeOffset.UtcNow), ct);
-                    return;
                 }
             }
-        }
-        finally
-        {
-            retryScope?.Dispose();
+
+            if (failure is null)
+            {
+                return;
+            }
+
+            var willRetry = attempt < maxAttempts;
+            if (willRetry)
+            {
+                var delay = BackoffFor(attempt);
+                _logger.LogWarning(
+                    failure,
+                    "Handler {Handler} failed for change {ChangeKey} on {TableName} " +
+                    "(attempt {Attempt} of {MaxAttempts}); retrying in {RetryDelay}",
+                    handlerName, change.Key, change.TableName, attempt, maxAttempts, delay);
+
+                await Task.Delay(delay, ct);
+                continue;
+            }
+
+            _logger.LogError(
+                failure,
+                "Handler {Handler} failed for change {ChangeKey} on {TableName} after {Attempts} attempt(s); " +
+                "the event is {Outcome}",
+                handlerName, change.Key, change.TableName, attempt,
+                _deadLetterSink is null ? "dropped" : "dead-lettered");
+
+            await DeadLetterAsync(
+                new CdcDeadLetter(change, handlerName, attempt, failure, DateTimeOffset.UtcNow), ct);
+            return;
         }
     }
 

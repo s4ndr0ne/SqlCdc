@@ -67,6 +67,31 @@ public class NewFeaturesTests
     }
 
     [Fact]
+    public void CdcChange_GetAfter_InvalidColumnConversionLeavesThePropertyAtItsDefault()
+    {
+        var change = new CdcChange
+        {
+            CaptureInstance = "dbo_Orders",
+            SourceSchema = "dbo",
+            SourceTable = "Orders",
+            Operation = CdcOperationType.Insert,
+            StartLsn = [1, 2, 3],
+            SeqVal = [4, 5, 6],
+            Before = new Dictionary<string, object?>(),
+            After = new Dictionary<string, object?>
+            {
+                ["Id"] = "not-an-integer",
+            },
+            UpdateMask = new Dictionary<string, bool>(),
+        };
+
+        var model = change.GetAfter<OrderModel>();
+
+        Assert.NotNull(model);
+        Assert.Equal(0, model.Id);
+    }
+
+    [Fact]
     public void CdcChange_GetBefore_DeserializesValuesCorrectly()
     {
         var change = new CdcChange

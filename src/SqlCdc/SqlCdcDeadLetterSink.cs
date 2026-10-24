@@ -1,4 +1,5 @@
 using System.Data;
+using System.Globalization;
 using System.Text.Json;
 using Microsoft.Data.SqlClient;
 
@@ -228,45 +229,60 @@ public sealed class SqlCdcDeadLetterSink : ICdcDeadLetterSink
                 },
                 PayloadOptions);
         }
-        catch (Exception)
+        catch (JsonException)
         {
-            try
-            {
-                return JsonSerializer.Serialize(
-                    new
-                    {
-                        Before = Stringify(change.Before),
-                        After = Stringify(change.After),
-                        change.UpdateMask,
-                    },
-                    PayloadOptions);
-            }
-            catch (Exception ex)
-            {
-                return JsonSerializer.Serialize(
-                    new
-                    {
-                        Error = $"Payload serialization failed: {ex.Message}",
-                        change.UpdateMask,
-                    },
-                    PayloadOptions);
-            }
+            return SerializeStringPayload(change);
+        }
+        catch (NotSupportedException)
+        {
+            return SerializeStringPayload(change);
+        }
+        catch (InvalidOperationException)
+        {
+            return SerializeStringPayload(change);
         }
     }
+
+    private static string SerializeStringPayload(CdcChange change) => JsonSerializer.Serialize(
+        new
+        {
+            Before = Stringify(change.Before),
+            After = Stringify(change.After),
+            change.UpdateMask,
+        },
+        PayloadOptions);
 
     private static Dictionary<string, string?> Stringify(IReadOnlyDictionary<string, object?> values)
     {
         var result = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         foreach (var (key, value) in values)
         {
-            try
+            result[key] = value switch
             {
-                result[key] = value?.ToString();
-            }
-            catch
-            {
-                result[key] = "<ToString failed>";
-            }
+                null => null,
+                string text => text,
+                byte[] bytes => Convert.ToBase64String(bytes),
+                bool boolean => boolean.ToString(),
+                char character => character.ToString(),
+                DateTime dateTime => dateTime.ToString("O", CultureInfo.InvariantCulture),
+                DateTimeOffset dateTimeOffset => dateTimeOffset.ToString("O", CultureInfo.InvariantCulture),
+                TimeSpan timeSpan => timeSpan.ToString("c", CultureInfo.InvariantCulture),
+                DateOnly dateOnly => dateOnly.ToString("O", CultureInfo.InvariantCulture),
+                TimeOnly timeOnly => timeOnly.ToString("O", CultureInfo.InvariantCulture),
+                Guid guid => guid.ToString("D"),
+                sbyte number => number.ToString(CultureInfo.InvariantCulture),
+                byte number => number.ToString(CultureInfo.InvariantCulture),
+                short number => number.ToString(CultureInfo.InvariantCulture),
+                ushort number => number.ToString(CultureInfo.InvariantCulture),
+                int number => number.ToString(CultureInfo.InvariantCulture),
+                uint number => number.ToString(CultureInfo.InvariantCulture),
+                long number => number.ToString(CultureInfo.InvariantCulture),
+                ulong number => number.ToString(CultureInfo.InvariantCulture),
+                float number => number.ToString(CultureInfo.InvariantCulture),
+                double number => number.ToString(CultureInfo.InvariantCulture),
+                decimal number => number.ToString(CultureInfo.InvariantCulture),
+                _ => $"<{value.GetType().FullName ?? value.GetType().Name}>",
+            };
         }
 
         return result;

@@ -55,19 +55,35 @@ public class ConnectionFactoryIntegrationTests
         const string table = "Orders_FactoryDelegate";
         await _sql.CreateCdcTableAsync(table);
 
-        await using var watcher = SqlCdcWatcherBuilder
-            .Create()
-            .UseConnectionFactory(_ => Task.FromResult(new SqlConnection(_sql.ConnectionString)))
-            .WatchTable("dbo", table)
-            .StartFrom(CdcStartMode.FromBeginning)
-            .WithPollInterval(TimeSpan.FromMilliseconds(200))
-            .Build();
+        var connections = new List<SqlConnection>();
+        try
+        {
+            await using var watcher = SqlCdcWatcherBuilder
+                .Create()
+                .UseConnectionFactory(_ =>
+                {
+                    var connection = new SqlConnection(_sql.ConnectionString);
+                    connections.Add(connection);
+                    return Task.FromResult(connection);
+                })
+                .WatchTable("dbo", table)
+                .StartFrom(CdcStartMode.FromBeginning)
+                .WithPollInterval(TimeSpan.FromMilliseconds(200))
+                .Build();
 
-        await watcher.StartAsync();
-        await _sql.ExecuteAsync($"INSERT INTO dbo.[{table}] (Id, Name) VALUES (2, N'second');");
+            await watcher.StartAsync();
+            await _sql.ExecuteAsync($"INSERT INTO dbo.[{table}] (Id, Name) VALUES (2, N'second');");
 
-        var change = Assert.Single(await ChangeCollector.CollectAsync(watcher, 1));
-        Assert.Equal(2, change.After["Id"]);
+            var change = Assert.Single(await ChangeCollector.CollectAsync(watcher, 1));
+            Assert.Equal(2, change.After["Id"]);
+        }
+        finally
+        {
+            foreach (var connection in connections)
+            {
+                await connection.DisposeAsync();
+            }
+        }
     }
 
     /// <summary>Wraps the built-in factory to prove the pipeline goes through it.</summary>

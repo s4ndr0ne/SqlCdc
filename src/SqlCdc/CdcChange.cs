@@ -169,9 +169,25 @@ public sealed record CdcChange
                     prop.SetValue(instance, rawValue);
                 }
             }
-            catch
+            catch (ArgumentException)
             {
-                // Leave default if conversion fails
+                continue;
+            }
+            catch (FormatException)
+            {
+                continue;
+            }
+            catch (InvalidCastException)
+            {
+                continue;
+            }
+            catch (OverflowException)
+            {
+                continue;
+            }
+            catch (NotSupportedException)
+            {
+                continue;
             }
         }
 

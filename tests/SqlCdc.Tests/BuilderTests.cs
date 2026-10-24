@@ -157,7 +157,7 @@ public class BuilderTests
         // requirement that a connection string otherwise carries.
         await using var watcher = SqlCdcWatcherBuilder
             .Create()
-            .UseConnectionFactory(_ => Task.FromResult(new Microsoft.Data.SqlClient.SqlConnection()))
+            .UseConnectionFactory(_ => throw new NotSupportedException("Building must not open a connection."))
             .WatchTable("dbo", "Orders")
             .Build();
 
@@ -181,7 +181,7 @@ public class BuilderTests
         var builder = SqlCdcWatcherBuilder
             .Create()
             .WatchTable("dbo", "Orders")
-            .UseConnectionFactory(_ => Task.FromResult(new Microsoft.Data.SqlClient.SqlConnection()))
+            .UseConnectionFactory(_ => throw new NotSupportedException("The factory must not be invoked during Build."))
             .UseAccessTokenCallback((_, _) => throw new NotSupportedException());
 
         Assert.Throws<InvalidOperationException>(() => builder.Build());

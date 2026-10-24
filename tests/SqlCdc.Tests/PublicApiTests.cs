@@ -29,7 +29,7 @@ public class PublicApiTests
         });
 
         var directory = ApprovalDirectory();
-        var approvedPath = Path.Combine(directory, "PublicApi.approved.txt");
+        var approvedPath = Path.Join(directory, "PublicApi.approved.txt");
 
         Assert.True(
             File.Exists(approvedPath),
@@ -43,7 +43,7 @@ public class PublicApiTests
         }
 
         // Written next to the approved file so accepting an intended change is a copy.
-        var receivedPath = Path.Combine(directory, "PublicApi.received.txt");
+        var receivedPath = Path.Join(directory, "PublicApi.received.txt");
         File.WriteAllText(receivedPath, actual + Environment.NewLine);
 
         Assert.Fail(

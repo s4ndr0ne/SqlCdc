@@ -189,8 +189,7 @@ public class CdcChangePairerTests
 
         return Assert.Single(
             CdcChangePairer.Pair("dbo", "Wide", "dbo_Wide", NineColumns, new[] { before, after },
-                    new Dictionary<string, DateTime>())
-                .ToList());
+                new Dictionary<string, DateTime>()));
     }
 
     [Fact]

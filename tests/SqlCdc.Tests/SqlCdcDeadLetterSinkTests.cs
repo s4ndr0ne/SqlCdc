@@ -61,7 +61,7 @@ public class SqlCdcDeadLetterSinkTests
     }
 
     [Fact]
-    public void SerializePayload_WhenPropertyAndToStringThrow_DoesNotThrowAndReportsFailure()
+    public void SerializePayload_WhenObjectSerializationFails_UsesTypeNameWithoutCallingToString()
     {
         var change = ChangeWith(new Dictionary<string, object?>
         {
@@ -71,6 +71,7 @@ public class SqlCdcDeadLetterSinkTests
         var json = SqlCdcDeadLetterSink.SerializePayload(change);
 
         Assert.NotNull(json);
-        Assert.Contains("ToString failed", json);
+        Assert.Contains("ThrowsOnPropertyAndToString", json);
+        Assert.DoesNotContain("ToString failed", json);
     }
 }

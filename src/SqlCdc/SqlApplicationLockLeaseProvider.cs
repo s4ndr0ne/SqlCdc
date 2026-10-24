@@ -214,11 +214,11 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
                 // the reason. Reporting it as lost is what lets another instance take over.
                 _logger.LogWarning(ex, "The connection holding the application lock {Resource} failed", _resource);
             }
-            catch (InvalidOperationException ex)
+            catch (ObjectDisposedException ex)
             {
                 _logger.LogWarning(ex, "The connection holding the application lock {Resource} failed", _resource);
             }
-            catch (ObjectDisposedException ex)
+            catch (InvalidOperationException ex)
             {
                 _logger.LogWarning(ex, "The connection holding the application lock {Resource} failed", _resource);
             }
@@ -272,16 +272,34 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
 
     private async Task ReleaseCoreAsync(CancellationToken cancellationToken)
     {
-        if (_connection is null)
+        var connection = _connection;
+        if (connection is null)
         {
             return;
         }
 
+        void ClearPoolAfterReleaseFailure(Exception exception)
+        {
+            // Closing an unpooled connection releases the lock anyway. A pooled one — a custom
+            // factory may hand those out — would go back to the pool still holding the session
+            // lock; clearing its pool makes the dispose below end the session for real, so the
+            // lock dies with it instead of lingering until the pool reuses the connection.
+            _logger.LogDebug(exception, "Releasing the application lock {Resource} failed", _resource);
+            try
+            {
+                SqlConnection.ClearPool(connection);
+            }
+            catch (InvalidOperationException clearPoolException)
+            {
+                _logger.LogTrace(clearPoolException, "Clearing the connection pool after lease release failed.");
+            }
+        }
+
         try
         {
-            if (_connection.State == ConnectionState.Open)
+            if (connection.State == ConnectionState.Open)
             {
-                await using var cmd = new SqlCommand("sys.sp_releaseapplock", _connection)
+                await using var cmd = new SqlCommand("sys.sp_releaseapplock", connection)
                 {
                     CommandType = CommandType.StoredProcedure,
                     CommandTimeout = _commandTimeoutSeconds,
@@ -291,21 +309,17 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
                 await cmd.ExecuteNonQueryAsync(cancellationToken);
             }
         }
-        catch (Exception ex)
+        catch (SqlException ex)
         {
-            // Closing an unpooled connection releases the lock anyway. A pooled one — a custom
-            // factory may hand those out — would go back to the pool still holding the session
-            // lock; clearing its pool makes the dispose below end the session for real, so the
-            // lock dies with it instead of lingering until the pool reuses the connection.
-            _logger.LogDebug(ex, "Releasing the application lock {Resource} failed", _resource);
-            try
-            {
-                SqlConnection.ClearPool(_connection);
-            }
-            catch
-            {
-                // Best effort: the connection may be in a state ClearPool rejects.
-            }
+            ClearPoolAfterReleaseFailure(ex);
+        }
+        catch (InvalidOperationException ex)
+        {
+            ClearPoolAfterReleaseFailure(ex);
+        }
+        catch (OperationCanceledException ex)
+        {
+            ClearPoolAfterReleaseFailure(ex);
         }
         finally
         {

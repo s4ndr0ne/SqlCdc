@@ -252,11 +252,6 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
         await _gate.WaitAsync();
         try
         {
-            if (_disposed)
-            {
-                return;
-            }
-
             _disposed = true;
             await ReleaseCoreAsync(CancellationToken.None);
         }

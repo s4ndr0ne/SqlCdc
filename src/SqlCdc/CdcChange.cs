@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace SqlCdc;
 
 /// <summary>
@@ -77,12 +79,12 @@ public sealed record CdcChange
         var properties = typeof(T).GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
         foreach (var prop in properties)
         {
-            if (!prop.CanWrite)
+            if (!prop.CanWrite || prop.GetIndexParameters().Length > 0)
             {
                 continue;
             }
 
-            if (!dict.TryGetValue(prop.Name, out var rawValue) || rawValue is null or DBNull)
+            if (!TryGetColumnValue(dict, prop.Name, out var rawValue) || rawValue is null or DBNull)
             {
                 continue;
             }
@@ -122,7 +124,7 @@ public sealed record CdcChange
                     {
                         prop.SetValue(instance, new DateTimeOffset(dt));
                     }
-                    else if (rawValue is string s && DateTimeOffset.TryParse(s, out var dto))
+                    else if (rawValue is string s && DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture, out var dto))
                     {
                         prop.SetValue(instance, dto);
                     }
@@ -133,7 +135,7 @@ public sealed record CdcChange
                     {
                         prop.SetValue(instance, dto.DateTime);
                     }
-                    else if (rawValue is string s && DateTime.TryParse(s, out var dt))
+                    else if (rawValue is string s && DateTime.TryParse(s, CultureInfo.InvariantCulture, out var dt))
                     {
                         prop.SetValue(instance, dt);
                     }
@@ -144,7 +146,7 @@ public sealed record CdcChange
                     {
                         prop.SetValue(instance, DateOnly.FromDateTime(dt));
                     }
-                    else if (rawValue is string s && DateOnly.TryParse(s, out var dOnly))
+                    else if (rawValue is string s && DateOnly.TryParse(s, CultureInfo.InvariantCulture, out var dOnly))
                     {
                         prop.SetValue(instance, dOnly);
                     }
@@ -155,14 +157,14 @@ public sealed record CdcChange
                     {
                         prop.SetValue(instance, TimeOnly.FromTimeSpan(ts));
                     }
-                    else if (rawValue is string s && TimeOnly.TryParse(s, out var tOnly))
+                    else if (rawValue is string s && TimeOnly.TryParse(s, CultureInfo.InvariantCulture, out var tOnly))
                     {
                         prop.SetValue(instance, tOnly);
                     }
                 }
                 else if (rawValue is IConvertible)
                 {
-                    prop.SetValue(instance, Convert.ChangeType(rawValue, targetType));
+                    prop.SetValue(instance, Convert.ChangeType(rawValue, targetType, CultureInfo.InvariantCulture));
                 }
                 else
                 {
@@ -192,6 +194,26 @@ public sealed record CdcChange
         }
 
         return instance;
+    }
+
+    private static bool TryGetColumnValue(IReadOnlyDictionary<string, object?> dict, string columnName, out object? value)
+    {
+        if (dict.TryGetValue(columnName, out value))
+        {
+            return true;
+        }
+
+        foreach (var (key, candidate) in dict)
+        {
+            if (string.Equals(key, columnName, StringComparison.OrdinalIgnoreCase))
+            {
+                value = candidate;
+                return true;
+            }
+        }
+
+        value = null;
+        return false;
     }
 
     /// <summary>

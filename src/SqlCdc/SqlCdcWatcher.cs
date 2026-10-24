@@ -299,7 +299,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     {
                         throw;
                     }
-                    catch (Exception ex)
+                    catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
                     {
                         _logger.LogDebug(ex, "The previous CDC polling task failed while StartAsync was waiting for it to stop.");
                     }
@@ -435,11 +435,15 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             {
                 await pollTask.WaitAsync(cancellationToken);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 // The caller cancelled only its wait. Leave cleanup to the polling loop's finally
                 // so a later StartAsync cannot race a still-running task or a disposed CTS.
                 return;
+            }
+            catch (OperationCanceledException)
+            {
+                // The polling task itself ended in a cancelled state; continue with stop cleanup.
             }
         }
 
@@ -560,7 +564,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
             // it just takes SQL Server a little longer to notice.
             _logger.LogDebug("Stopping was cancelled before the CDC lease could be released.");
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Dropping the lease connection releases it anyway; failing to stop would be worse.
             _logger.LogWarning(ex, "Releasing the CDC lease failed.");
@@ -628,7 +632,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                     {
                         return;
                     }
-                    catch (Exception ex)
+                    catch (Exception ex) when (!ct.IsCancellationRequested)
                     {
                         // Interlocked so a concurrent GetStatus read is never torn, and so two
                         // concurrent polling paths (not possible today, but safe) cannot lose one.
@@ -654,11 +658,11 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 }
             }
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch (Exception ex) when (ct.IsCancellationRequested)
         {
-            _logger.LogDebug("The CDC polling loop was cancelled.");
+            _logger.LogDebug(ex, "The CDC polling loop was cancelled.");
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             // Set before the channel completes, so a consumer that observes the completion can
             // already tell a crash from a deliberate stop through HasCrashed.
@@ -775,7 +779,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         {
             throw;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             RecordLeaseFailure(ex);
             // If the store comes back and this instance acquires the lease, the standby has ended;
@@ -821,7 +825,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         {
             throw;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             // Unable to tell is treated as lost: the lease lives on a connection, and a connection
             // that cannot answer may well have dropped it already.
@@ -964,6 +968,7 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
         }
 
         var batchesRead = 0;
+        var rangeExhausted = true;
         while (LsnHelpers.Compare(cursor, maxLsn) <= 0)
         {
             var batch = await ReadChangesAsync(conn, table, cursor, maxLsn, ct);
@@ -1020,6 +1025,13 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
                 }
             }
 
+            if (batch.Rows.Count == 0 && batch.PartialLsn is not null)
+            {
+                // Oversized transaction rows vanished between the two reads; re-evaluate on next poll.
+                rangeExhausted = false;
+                break;
+            }
+
             // An empty batch cannot advance the cursor, so it must end the loop whatever HitCap
             // says, or the poll would spin on the same range.
             if (batch.Rows.Count == 0 || !batch.HitCap || table.Watermark is null
@@ -1030,18 +1042,26 @@ public sealed class SqlCdcWatcher : IAsyncDisposable
 
             if (_options.MaxBatchesPerTablePerPoll is { } maxBatches && batchesRead >= maxBatches)
             {
+                rangeExhausted = false;
                 break;
             }
         }
 
-        // The loop above only exits with the watermark short of maxLsn when the rest of the range
-        // was read and turned out empty, so the watermark can safely record "read up to here". An
-        // idle table would otherwise stand still until the CDC cleanup job trimmed past it and the
-        // clamp above reported changes as lost that never existed. Throttled: an idle table costs
-        // one small write every IdleWatermarkPersistInterval, not one per poll.
-        if ((table.Watermark is null || LsnHelpers.Compare(table.Watermark, maxLsn) < 0)
+        // The loop above only exits with rangeExhausted and the watermark short of maxLsn when the
+        // rest of the range was read and turned out empty, so the watermark can safely record
+        // "read up to here". An idle table would otherwise stand still until the CDC cleanup job
+        // trimmed past it and the clamp above reported changes as lost that never existed.
+        // Throttled: an idle table costs one small write every IdleWatermarkPersistInterval, not
+        // one per poll.
+        if (rangeExhausted
+            && (table.Watermark is null || LsnHelpers.Compare(table.Watermark, maxLsn) < 0)
             && Environment.TickCount64 >= table.NextIdleWatermarkSaveTick)
         {
+            if (conn.State != ConnectionState.Open)
+            {
+                await conn.OpenAsync(ct);
+            }
+
             table.Watermark = maxLsn;
             await SaveLastLsnAsync(conn, table.CaptureInstance, maxLsn, ct);
             table.NextIdleWatermarkSaveTick =

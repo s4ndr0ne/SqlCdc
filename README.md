@@ -106,13 +106,13 @@ public sealed class OrderChangedHandler(AppDbContext db) : ICdcChangeHandler
 
 #### Handler routing and batching
 - **Table-specific routing**: Register with `AddCdcChangeHandler<T>("schema", "table")`, implement
-  `ICdcTableChangeHandler`, or annotate with `[CdcTable("table")]`. Handlers only receive matching events.
+  `ICdcTableChangeHandler` (`SourceSchema` and `SourceTable`), or annotate with `[CdcTable("table")]` / `[CdcTable("schema", "table")]`. Handlers only receive matching events.
   Plain `ICdcChangeHandler` without filters receives all events.
 - **Batch processing**: Register with `AddCdcBatchChangeHandler<TBatch>()` implementing
   `ICdcBatchChangeHandler`. Changes currently queued on the channel are grouped up to `BatchSize`
-  and delivered together — ideal for bulk ingestion into Elasticsearch, Kafka, or data warehouses.
+  into an isolated batch list and delivered together — ideal for bulk ingestion into Elasticsearch, Kafka, or data warehouses.
 - **Strongly-typed mapping**: Call `change.GetAfter<T>()` or `change.GetBefore<T>()` to automatically
-  map CDC columns into properties/records, handling SQL data types (`Guid`, `DateTime`, `DateOnly`, enums, numerics).
+  map CDC columns (case-insensitively and using `CultureInfo.InvariantCulture`) into properties/records, handling SQL data types (`Guid`, `DateTime`, `DateTimeOffset`, `DateOnly`, `TimeOnly`, enums, numerics).
 
 Each handler is **scoped** and resolved in a dedicated scope per event (or batch), so injecting a
 `DbContext` is safe. A handler that throws is retried according to `WithHandlerRetry` and then dead-lettered — see
@@ -486,7 +486,7 @@ foreach (var record in records)
 
 Registering a handler without a sink fails when the host starts: a failed handler has its change
 acknowledged and the watermark moves past it, so without a sink the change would be gone.
-Retries and dead-lettering apply to handlers registered with `AddCdcChangeHandler`. Code that
+Retries and dead-lettering apply to handlers registered with `AddCdcChangeHandler` and `AddCdcBatchChangeHandler`. Code that
 reads `watcher.Changes` directly owns its own error handling and must call `Acknowledge()` for
 every change under the default checkpoint mode.
 

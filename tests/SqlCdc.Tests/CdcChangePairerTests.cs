@@ -183,7 +183,12 @@ public class CdcChangePairerTests
 
     private static CdcChange PairWideUpdate(byte[] mask)
     {
-        var values = Values(NineColumns.Select(c => (c, (object?)c)).ToArray());
+        var values = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var column in NineColumns)
+        {
+            values[column] = column;
+        }
+
         var before = Row(3, values: values);
         var after = Row(4, seqVal: before.SeqVal, values: values, mask: mask);
 

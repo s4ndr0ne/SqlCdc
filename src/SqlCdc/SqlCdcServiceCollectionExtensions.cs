@@ -201,7 +201,12 @@ public static class SqlCdcServiceCollectionExtensions
     }
 }
 
-internal sealed class TableBoundChangeHandler<THandler> : ICdcTableChangeHandler
+internal interface ITableBoundChangeHandler : ICdcTableChangeHandler
+{
+    Type HandlerType { get; }
+}
+
+internal sealed class TableBoundChangeHandler<THandler> : ITableBoundChangeHandler
     where THandler : class, ICdcChangeHandler
 {
     private readonly THandler _inner;
@@ -213,6 +218,7 @@ internal sealed class TableBoundChangeHandler<THandler> : ICdcTableChangeHandler
         SourceTable = table;
     }
 
+    public Type HandlerType => typeof(THandler);
     public string? SourceSchema { get; }
     public string SourceTable { get; }
 

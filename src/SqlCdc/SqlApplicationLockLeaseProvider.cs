@@ -29,7 +29,7 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly int _commandTimeoutSeconds;
     private SqlConnection? _connection;
-    private bool _disposed;
+    private int _disposed;
 
     /// <summary>
     /// Creates a lease provider for the database the connection string points at. The lease is
@@ -105,11 +105,13 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
 
     public async Task<bool> TryAcquireAsync(CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         await _gate.WaitAsync(cancellationToken);
         try
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
             if (_connection is not null)
             {
                 return true;
@@ -167,11 +169,13 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
 
     public async Task<bool> IsHeldAsync(CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         await _gate.WaitAsync(cancellationToken);
         try
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
             if (_connection is null)
             {
                 return false;
@@ -234,12 +238,20 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
 
     public async Task ReleaseAsync(CancellationToken cancellationToken = default)
     {
-        if (_disposed)
+        if (Volatile.Read(ref _disposed) != 0)
         {
             return;
         }
 
-        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            await _gate.WaitAsync(cancellationToken);
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
         try
         {
             await ReleaseCoreAsync(cancellationToken);
@@ -252,7 +264,7 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
 
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return;
         }
@@ -260,14 +272,14 @@ public sealed class SqlApplicationLockLeaseProvider : ICdcLeaseProvider
         await _gate.WaitAsync();
         try
         {
-            _disposed = true;
             await ReleaseCoreAsync(CancellationToken.None);
         }
         finally
         {
             _gate.Release();
-            _gate.Dispose();
         }
+
+        _gate.Dispose();
     }
 
     private async Task ReleaseCoreAsync(CancellationToken cancellationToken)

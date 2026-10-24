@@ -287,6 +287,9 @@ public sealed class SqlCdcWatcherBuilder
         return this;
     }
 
+    internal SqlCdcWatcherBuilder WithHandlerRetryDelay(TimeSpan retryDelay) =>
+        WithHandlerRetry(_maxHandlerAttempts, retryDelay);
+
     /// <summary>
     /// Opens every connection — CDC reads, watermarks and the lease — through the given factory
     /// instead of a plain connection string. This is the hook for a configured

@@ -363,4 +363,52 @@ public class NewFeaturesTests
         var batch = Assert.Single(batchHandler.Batches);
         Assert.Equal(2, batch.Count);
     }
+
+    [Fact]
+    public void CdcChange_GetAfter_MatchesColumnNamesCaseInsensitively()
+    {
+        var change = new CdcChange
+        {
+            CaptureInstance = "dbo_Orders",
+            SourceSchema = "dbo",
+            SourceTable = "Orders",
+            Operation = CdcOperationType.Insert,
+            StartLsn = [1, 2, 3],
+            SeqVal = [4, 5, 6],
+            Before = new Dictionary<string, object?>(),
+            After = new Dictionary<string, object?>
+            {
+                ["id"] = 77,
+                ["customername"] = "CaseInsensitive",
+                ["total"] = "19.99",
+            },
+            UpdateMask = new Dictionary<string, bool>(),
+        };
+
+        var model = change.GetAfter<OrderModel>();
+        Assert.NotNull(model);
+        Assert.Equal(77, model.Id);
+        Assert.Equal("CaseInsensitive", model.CustomerName);
+        Assert.Equal(19.99m, model.Total);
+    }
+
+    [Fact]
+    public void Configuration_HandlerRetryDelayAlone_PreservesConfiguredMaxHandlerAttempts()
+    {
+        var config = new SqlCdcConfiguration
+        {
+            HandlerRetryDelay = TimeSpan.FromSeconds(12),
+        };
+
+        var builder = SqlCdcWatcherBuilder.Create()
+            .UseConnectionString("Server=.;Database=x;Encrypt=True")
+            .WatchTable("dbo", "Orders")
+            .WithHandlerRetry(4, TimeSpan.FromSeconds(2));
+
+        config.ApplyTo(builder);
+        var watcher = builder.Build();
+
+        Assert.Equal(4, watcher.Options.MaxHandlerAttempts);
+        Assert.Equal(TimeSpan.FromSeconds(12), watcher.Options.HandlerRetryDelay);
+    }
 }

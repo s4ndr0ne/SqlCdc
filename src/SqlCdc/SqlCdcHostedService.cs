@@ -78,17 +78,15 @@ internal sealed class SqlCdcHostedService : BackgroundService
                 // Re-evaluated on every iteration: a restarted watcher delivers on a new channel.
                 if (_hasBatchHandlers)
                 {
-                    var batch = new List<CdcChange>();
                     await foreach (var change in _watcher.Changes.WithCancellation(stoppingToken))
                     {
-                        batch.Add(change);
+                        var batch = new List<CdcChange> { change };
                         while (batch.Count < _watcher.Options.BatchSize && _watcher.Channel.Reader.TryRead(out var nextChange))
                         {
                             batch.Add(nextChange);
                         }
 
                         await DispatchBatchAsync(batch, stoppingToken);
-                        batch.Clear();
                     }
                 }
                 else if (_hasHandlers)
@@ -106,7 +104,7 @@ internal sealed class SqlCdcHostedService : BackgroundService
                     await _watcher.Channel.Reader.Completion.WaitAsync(stoppingToken);
                 }
             }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            catch (Exception) when (stoppingToken.IsCancellationRequested)
             {
                 return;
             }
@@ -161,11 +159,11 @@ internal sealed class SqlCdcHostedService : BackgroundService
                 await _watcher.StartAsync(stoppingToken);
                 return true;
             }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            catch (Exception) when (stoppingToken.IsCancellationRequested)
             {
                 return false;
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
             {
                 _logger.LogError(
                     ex,
@@ -196,6 +194,9 @@ internal sealed class SqlCdcHostedService : BackgroundService
         return scope.ServiceProvider.GetServices<ICdcBatchChangeHandler>().Any();
     }
 
+    private static Type GetHandlerType(object handler) =>
+        handler is ITableBoundChangeHandler bound ? bound.HandlerType : handler.GetType();
+
     private static bool HandlerMatches(ICdcChangeHandler handler, CdcChange change)
     {
         if (handler is ICdcTableChangeHandler tableHandler)
@@ -212,7 +213,7 @@ internal sealed class SqlCdcHostedService : BackgroundService
             }
         }
 
-        var tableAttrs = handler.GetType().GetCustomAttributes(typeof(CdcTableAttribute), inherit: true);
+        var tableAttrs = GetHandlerType(handler).GetCustomAttributes(typeof(CdcTableAttribute), inherit: true);
         if (tableAttrs.Length > 0)
         {
             var matches = false;
@@ -309,7 +310,7 @@ internal sealed class SqlCdcHostedService : BackgroundService
                 {
                     throw;
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (!ct.IsCancellationRequested)
                 {
                     failure = ex;
                 }
@@ -357,9 +358,7 @@ internal sealed class SqlCdcHostedService : BackgroundService
         ICdcChangeHandler initialHandler, int handlerIndex, CdcChange change, CancellationToken ct)
     {
         var handler = initialHandler;
-        var handlerName = handler.GetType().IsGenericType
-            ? handler.GetType().GetGenericArguments()[0].Name
-            : handler.GetType().Name;
+        var handlerName = GetHandlerType(handler).Name;
         var maxAttempts = _watcher.Options.MaxHandlerAttempts;
 
         for (var attempt = 1; ; attempt++)
@@ -397,7 +396,7 @@ internal sealed class SqlCdcHostedService : BackgroundService
                 {
                     throw;
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (!ct.IsCancellationRequested)
                 {
                     failure = ex;
                     var attemptWillRetry = attempt < maxAttempts;
@@ -463,7 +462,7 @@ internal sealed class SqlCdcHostedService : BackgroundService
             {
                 throw;
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!ct.IsCancellationRequested)
             {
                 var delay = BackoffFor(attempt);
 

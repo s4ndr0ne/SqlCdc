@@ -167,7 +167,7 @@ public sealed class SqlCdcConfiguration
         }
         else if (HandlerRetryDelay is { } handlerRetryDelay)
         {
-            builder.WithHandlerRetry(1, handlerRetryDelay);
+            builder.WithHandlerRetryDelay(handlerRetryDelay);
         }
     }
 }

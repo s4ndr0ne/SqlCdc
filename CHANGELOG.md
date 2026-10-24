@@ -6,13 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a data-loss bug when `MaxBatchesPerTablePerPoll` was configured: stopping a table poll early after reaching `maxBatches` previously triggered the idle-table watermark advance and overwrote the table watermark with `maxLsn`, skipping unread batches in the backlog.
+- Fixed a disposal race condition in `SqlApplicationLockLeaseProvider` where concurrent `TryAcquireAsync`, `IsHeldAsync`, `ReleaseAsync`, and `DisposeAsync` calls could acquire a lock after disposal or throw `ObjectDisposedException` when releasing the internal semaphore.
+- Fixed `SqlCdcWatcher.StopAsync` returning before running stop cleanup and lease release when the polling task itself completed in a `Canceled` state while the caller's `cancellationToken` was not cancelled.
+- Fixed `SqlCdcHostedService` reusing and clearing the same `List<CdcChange>` instance across batches after passing it as `IReadOnlyList<CdcChange>` to `ICdcBatchChangeHandler.HandleBatchAsync`.
+- Fixed handler type resolution in `SqlCdcHostedService` so user-defined generic handlers report their own type name in metrics and dead-letter records, and `[CdcTable]` attributes on handlers registered via `AddCdcChangeHandler<THandler>(schema, table)` are respected.
+- Fixed `CdcChange.GetAfter<T>()` and `GetBefore<T>()` to use `CultureInfo.InvariantCulture` for string/numeric/date parsing, match column names case-insensitively regardless of the dictionary comparer, and ignore indexer properties.
+- Fixed `SqlCdcConfiguration.ApplyTo` resetting `MaxHandlerAttempts` to `1` when only `HandlerRetryDelay` is specified in configuration.
+- Guarded exception catch blocks across `SqlCdcWatcher` and `SqlCdcHostedService` with cancellation filters (`when (!ct.IsCancellationRequested)`) and resolved all CodeQL code-quality alerts (`cs/catch-of-all-exceptions`, `cs/missed-using-statement`, `cs/useless-upcast`).
+
 ## [3.2.0] - 2026-10-18
 
 ### Added
 
 - **Table-specific change handler routing**:
   - `[CdcTable("schema", "table")]` attribute to target specific tables declaratively.
-  - `ICdcTableChangeHandler` interface with `TargetSchema` and `TargetTable` properties for dynamic table filtering.
+  - `ICdcTableChangeHandler` interface with `SourceSchema` and `SourceTable` properties for dynamic table filtering.
   - `AddCdcChangeHandler<THandler>("schema", "table")` DI registration overload.
   - `SqlCdcHostedService` routes CDC changes only to handlers matching the target table, while non-filtered handlers continue to receive all changes.
 - **Batch change handling**:

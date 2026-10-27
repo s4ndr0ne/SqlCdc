@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [3.2.1] - 2026-10-27
+
 ### Fixed
 
 - Fixed a data-loss bug when `MaxBatchesPerTablePerPoll` was configured: stopping a table poll early after reaching `maxBatches` previously triggered the idle-table watermark advance and overwrote the table watermark with `maxLsn`, skipping unread batches in the backlog.
@@ -283,6 +285,7 @@ consumer pinned to `Microsoft.Data.SqlClient` 6.x has to move as well.
 
 First release.
 
+[3.2.1]: https://github.com/s4ndr0ne/SqlCdc/compare/v3.2.0...v3.2.1
 [3.2.0]: https://github.com/s4ndr0ne/SqlCdc/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/s4ndr0ne/SqlCdc/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/s4ndr0ne/SqlCdc/compare/v2.0.0...v3.0.0
